@@ -96,12 +96,12 @@ pub enum Layers {
 impl Display for Layers {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match self {
-            Layers::Ethernet(ref layer) => layer.fmt(f),
-            Layers::Arp(ref layer) => layer.fmt(f),
-            Layers::Ipv4(ref layer) => layer.fmt(f),
-            Layers::Icmpv4(ref layer) => layer.fmt(f),
-            Layers::Tcp(ref layer) => layer.fmt(f),
-            Layers::Udp(ref layer) => layer.fmt(f),
+            Layers::Ethernet(layer) => layer.fmt(f),
+            Layers::Arp(layer) => layer.fmt(f),
+            Layers::Ipv4(layer) => layer.fmt(f),
+            Layers::Icmpv4(layer) => layer.fmt(f),
+            Layers::Tcp(layer) => layer.fmt(f),
+            Layers::Udp(layer) => layer.fmt(f),
         }
     }
 }
@@ -109,34 +109,34 @@ impl Display for Layers {
 impl Layer for Layers {
     fn kind(&self) -> LayerKind {
         match self {
-            Layers::Ethernet(ref layer) => layer.kind(),
-            Layers::Arp(ref layer) => layer.kind(),
-            Layers::Ipv4(ref layer) => layer.kind(),
-            Layers::Icmpv4(ref layer) => layer.kind(),
-            Layers::Tcp(ref layer) => layer.kind(),
-            Layers::Udp(ref layer) => layer.kind(),
+            Layers::Ethernet(layer) => layer.kind(),
+            Layers::Arp(layer) => layer.kind(),
+            Layers::Ipv4(layer) => layer.kind(),
+            Layers::Icmpv4(layer) => layer.kind(),
+            Layers::Tcp(layer) => layer.kind(),
+            Layers::Udp(layer) => layer.kind(),
         }
     }
 
     fn len(&self) -> usize {
         match self {
-            Layers::Ethernet(ref layer) => layer.len(),
-            Layers::Arp(ref layer) => layer.len(),
-            Layers::Ipv4(ref layer) => layer.len(),
-            Layers::Icmpv4(ref layer) => layer.len(),
-            Layers::Tcp(ref layer) => layer.len(),
-            Layers::Udp(ref layer) => layer.len(),
+            Layers::Ethernet(layer) => layer.len(),
+            Layers::Arp(layer) => layer.len(),
+            Layers::Ipv4(layer) => layer.len(),
+            Layers::Icmpv4(layer) => layer.len(),
+            Layers::Tcp(layer) => layer.len(),
+            Layers::Udp(layer) => layer.len(),
         }
     }
 
     fn serialize(&self, buffer: &mut [u8], n: usize) -> io::Result<usize> {
         match self {
-            Layers::Ethernet(ref layer) => layer.serialize(buffer, n),
-            Layers::Arp(ref layer) => layer.serialize(buffer, n),
-            Layers::Ipv4(ref layer) => layer.serialize(buffer, n),
-            Layers::Icmpv4(ref layer) => layer.serialize(buffer, n),
-            Layers::Tcp(ref layer) => layer.serialize(buffer, n),
-            Layers::Udp(ref layer) => layer.serialize(buffer, n),
+            Layers::Ethernet(layer) => layer.serialize(buffer, n),
+            Layers::Arp(layer) => layer.serialize(buffer, n),
+            Layers::Ipv4(layer) => layer.serialize(buffer, n),
+            Layers::Icmpv4(layer) => layer.serialize(buffer, n),
+            Layers::Tcp(layer) => layer.serialize(buffer, n),
+            Layers::Udp(layer) => layer.serialize(buffer, n),
         }
     }
 
@@ -147,12 +147,12 @@ impl Layer for Layers {
         n: usize,
     ) -> io::Result<usize> {
         match self {
-            Layers::Ethernet(ref layer) => layer.serialize_with_payload(buffer, payload, n),
-            Layers::Arp(ref layer) => layer.serialize_with_payload(buffer, payload, n),
-            Layers::Ipv4(ref layer) => layer.serialize_with_payload(buffer, payload, n),
-            Layers::Icmpv4(ref layer) => layer.serialize_with_payload(buffer, payload, n),
-            Layers::Tcp(ref layer) => layer.serialize_with_payload(buffer, payload, n),
-            Layers::Udp(ref layer) => layer.serialize_with_payload(buffer, payload, n),
+            Layers::Ethernet(layer) => layer.serialize_with_payload(buffer, payload, n),
+            Layers::Arp(layer) => layer.serialize_with_payload(buffer, payload, n),
+            Layers::Ipv4(layer) => layer.serialize_with_payload(buffer, payload, n),
+            Layers::Icmpv4(layer) => layer.serialize_with_payload(buffer, payload, n),
+            Layers::Tcp(layer) => layer.serialize_with_payload(buffer, payload, n),
+            Layers::Udp(layer) => layer.serialize_with_payload(buffer, payload, n),
         }
     }
 }

@@ -135,8 +135,8 @@ async fn main() {
 
 fn show_info(src: Ipv4Network, gw: Ipv4Addr, mtu: usize) {
     macro_rules! max {
-        ($x: expr) => ($x);
-        ($x: expr, $($z: expr),+) => (::std::cmp::max($x, max!($($z),*)));
+        ($x: expr_2021) => ($x);
+        ($x: expr_2021, $($z: expr_2021),+) => (::std::cmp::max($x, max!($($z),*)));
     }
 
     let src_str = match src.size() {

@@ -1565,7 +1565,7 @@ impl Redirector {
                     state.admit(tcp.acknowledgement());
                     if state.duplicate() >= DUPLICATES_THRESHOLD {
                         let is_cooled_down = match state.last_retrans() {
-                            Some(ref instant) => instant.elapsed().as_millis() < RETRANS_COOL_DOWN,
+                            Some(instant) => instant.elapsed().as_millis() < RETRANS_COOL_DOWN,
                             None => false,
                         };
 
@@ -1639,7 +1639,7 @@ impl Redirector {
                 let mut tx_locked = self.tx.lock().unwrap();
 
                 let mut rng = rand::thread_rng();
-                let sequence = rng.gen::<u32>();
+                let sequence = rng.r#gen::<u32>();
                 let acknowledgement = tcp.sequence().checked_add(1).unwrap_or(0);
                 if let Some(mss) = tcp.mss() {
                     let mtu = Ipv4::minimum_len() + Tcp::minimum_len() + mss as usize;
