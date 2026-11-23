@@ -1577,21 +1577,28 @@ impl Redirector {
             #[allow(clippy::single_match)]
             match kind {
                 LayerKinds::Udp => {
-                    let dst = icmpv4.dst().unwrap();
-                    self.unbind_local_udp_port(dst);
+                    // An ICMP error may quote fewer than eight UDP header bytes.
+                    if let Some(dst) = icmpv4.dst() {
+                        self.unbind_local_udp_port(dst);
+                    }
                 }
                 _ => {}
             }
         } else if icmpv4.is_fragmentation_required_and_df_flag_set() {
             // Fragmentation required, and DF flag set
-            let mtu = icmpv4.next_hop_mtu().unwrap();
+            // The quoted IPv4 packet and the next-hop MTU are both untrusted.
+            let (Some(mtu), Some(dst_ip_addr)) =
+                (icmpv4.next_hop_mtu(), icmpv4.dst_ip_addr())
+            else {
+                return Ok(());
+            };
             if self
                 .tx
                 .lock()
                 .unwrap()
-                .set_src_mtu(icmpv4.dst_ip_addr().unwrap(), mtu as usize)
+                .set_src_mtu(dst_ip_addr, mtu as usize)
             {
-                info!("Update MTU of {} to {}", icmpv4.dst_ip_addr().unwrap(), mtu);
+                info!("Update MTU of {} to {}", dst_ip_addr, mtu);
             }
         }
 
@@ -2106,5 +2113,67 @@ mod tcp_segmentation_tests {
         assert!(!Forwarder::fin_for_segment(true, 2920, 3000));
         assert!(Forwarder::fin_for_segment(true, 3000, 3000));
         assert!(!Forwarder::fin_for_segment(false, 3000, 3000));
+    }
+}
+
+#[cfg(test)]
+mod malformed_icmp_tests {
+    use super::*;
+    use pnet::packet::icmp::{destination_unreachable, Icmp, IcmpTypes};
+
+    fn redirector() -> Redirector {
+        let local = Ipv4Addr::new(192, 0, 2, 250);
+        let forwarder = Forwarder::new(
+            Box::new(pcap::BlackHole::new()),
+            1500,
+            pcap::HARDWARE_ADDR_UNSPECIFIED,
+            local,
+        );
+        Redirector::new(
+            Arc::new(Mutex::new(forwarder)),
+            Ipv4Network::new(Ipv4Addr::new(192, 0, 2, 0), 24).unwrap(),
+            local,
+            None,
+            ProxyConfig::new_socks(
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1080), false, false, None,
+            ),
+            None,
+        )
+    }
+
+    #[test]
+    fn ignore_port_unreachable_without_quoted_udp_header() {
+        // A complete quoted IPv4 header identifies UDP, but has no UDP ports.
+        let mut quote = [0u8; 20];
+        quote[0] = 0x45;
+        quote[2..4].copy_from_slice(&20u16.to_be_bytes());
+        quote[9] = 17;
+        let error = Icmpv4::new_destination_port_unreachable(&quote);
+        assert_eq!(error.next_level_layer_kind(), Some(LayerKinds::Udp));
+        assert_eq!(error.dst(), None);
+        assert!(redirector().handle_icmpv4(&error).is_ok());
+    }
+
+    #[test]
+    fn ignore_fragmentation_needed_without_quoted_ipv4_header() {
+        let error = Icmpv4::from(Icmp {
+            icmp_type: IcmpTypes::DestinationUnreachable,
+            icmp_code: destination_unreachable::IcmpCodes::FragmentationRequiredAndDFFlagSet,
+            checksum: 0,
+            payload: vec![0, 0, 0x05, 0xdc],
+        });
+        assert_eq!(error.next_hop_mtu(), Some(1500));
+        assert_eq!(error.dst_ip_addr(), None);
+        assert!(redirector().handle_icmpv4(&error).is_ok());
+    }
+
+    #[test]
+    fn ignore_quoted_ipv4_header_with_invalid_ihl() {
+        let mut quote = [0u8; 20];
+        quote[0] = 0x4f; // IHL claims 60 bytes, only 20 are present.
+        quote[9] = 17;
+        let error = Icmpv4::new_destination_port_unreachable(&quote);
+        assert_eq!(error.next_level_layer_kind(), None);
+        assert!(redirector().handle_icmpv4(&error).is_ok());
     }
 }

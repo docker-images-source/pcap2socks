@@ -222,6 +222,15 @@ impl Icmpv4 {
         let payload = &self.layer.payload[4..];
         match Ipv4Packet::new(payload) {
             Some(ref ipv4_packet) => {
+                // ICMP quotes may be truncated; reject an invalid inner IPv4 IHL
+                // before asking pnet to access the quoted transport payload.
+                let header_len = ipv4_packet.get_header_length() as usize * 4;
+                if ipv4_packet.get_version() != 4
+                    || header_len < Ipv4::minimum_len()
+                    || header_len > payload.len()
+                {
+                    return None;
+                }
                 let ipv4 = Ipv4::parse(ipv4_packet);
                 // Fragment
                 if !ipv4.is_fragment() {
