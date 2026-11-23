@@ -102,6 +102,7 @@ const MAX_UDP_PENDING_DATAGRAMS: usize = 256;
 
 /// Represents a worker of a proxied TCP stream.
 pub struct StreamWorker {
+    src: SocketAddrV4,
     dst: SocketAddrV4,
     tx_tx: UnboundedSender<QueuedTcpPayload>,
     queued_bytes: Arc<AtomicUsize>,
@@ -188,10 +189,10 @@ impl StreamWorker {
                 match result {
                     Ok(Ok(())) => debug!(
                         "send to proxy: {}: {} -> {} ({} Bytes)",
-                        "TCP", 0, dst, payload.bytes.len()
+                        "TCP", src, dst, payload.bytes.len()
                     ),
                     Ok(Err(e)) => {
-                        warn!("handle send: TCP: {} -> {}: {}", 0, dst, e);
+                        warn!("handle send: TCP: {} -> {}: {}", src, dst, e);
                         break;
                     }
                     Err(_) => {
@@ -201,7 +202,7 @@ impl StreamWorker {
                 }
             }
             is_tx_closed_cloned.store(true, Ordering::Relaxed);
-            trace!("close stream TX {} -> {}", 0, dst);
+            trace!("close stream TX {} -> {}", src, dst);
         });
 
         // Receive
@@ -226,7 +227,7 @@ impl StreamWorker {
                             Ok(this_size) => if this_size > 0 {
                                 debug!(
                                     "receive from proxy: {}: {} -> {} ({} Bytes)",
-                                    "TCP", dst, 0, this_size
+                                    "TCP", dst, src, this_size
                                 );
 
                                 size = this_size;
@@ -245,7 +246,7 @@ impl StreamWorker {
                                     continue;
                                 }
 
-                                warn!("receive from proxy: {}: {} -> {}: {}", "TCP", dst, 0, e);
+                                warn!("receive from proxy: {}: {} -> {}: {}", "TCP", dst, src, e);
 
                                 size = 0;
                             }
@@ -274,7 +275,7 @@ impl StreamWorker {
                                         {
                                             warn!(
                                                 "handle receive: {}: {} -> {}: {}",
-                                                "TCP", dst, 0, e
+                                                "TCP", dst, src, e
                                             );
                                         }
                                         is_sent = true;
@@ -282,7 +283,7 @@ impl StreamWorker {
                                 }
                                 Err(ref e) => {
                                     is_sent = true;
-                                    warn!("handle receive: {}: {} -> {}: {}", "TCP", dst, 0, e)
+                                    warn!("handle receive: {}: {} -> {}: {}", "TCP", dst, src, e)
                                 }
                             }
                         }
@@ -300,12 +301,12 @@ impl StreamWorker {
                 } else {
                     // Close
                     is_rx_closed_cloned.store(true, Ordering::Relaxed);
-                    trace!("close stream RX {} -> {}", dst, 0);
+                    trace!("close stream RX {} -> {}", dst, src);
 
                     let mut forwarder = tx.lock().unwrap();
                     if !cancelled_rx.load(Ordering::Relaxed) {
                         if let Err(ref e) = forwarder.close(dst, src) {
-                            warn!("handle close: {}: {} -> {}: {}", "TCP", dst, 0, e);
+                            warn!("handle close: {}: {} -> {}: {}", "TCP", dst, src, e);
                         }
                     }
 
@@ -337,14 +338,15 @@ impl StreamWorker {
                         }
                         return;
                     }
-                    warn!("handle timeout: {}: {} -> {}: {}", "TCP", dst, 0, e);
+                    warn!("handle timeout: {}: {} -> {}: {}", "TCP", dst, src, e);
                 }
             }
         });
 
-        trace!("open stream {} -> {}", 0, dst);
+        trace!("open stream {} -> {}", src, dst);
 
         Ok(StreamWorker {
+            src,
             dst,
             tx_tx,
             queued_bytes,
@@ -422,13 +424,14 @@ impl StreamWorker {
 impl Drop for StreamWorker {
     fn drop(&mut self) {
         self.close();
-        trace!("drop stream {} -> {}", 0, self.dst);
+        trace!("drop stream {} -> {}", self.src, self.dst);
     }
 }
 
 /// Represents a worker of a proxied TCP stream. Comparing with `StreamWorker`, `StreamWorker2` do
 /// not require the ownership of the sent payload, but have to wait until the payload was sent.
 pub struct StreamWorker2 {
+    src: SocketAddrV4,
     dst: SocketAddrV4,
     stream_tx: Option<OwnedWriteHalf>,
     is_tx_closed: Arc<AtomicBool>,
@@ -481,7 +484,7 @@ impl StreamWorker2 {
                             Ok(this_size) => if this_size > 0 {
                                 debug!(
                                     "receive from proxy: {}: {} -> {} ({} Bytes)",
-                                    "TCP", dst, 0, this_size
+                                    "TCP", dst, src, this_size
                                 );
 
                                 size = this_size;
@@ -511,15 +514,15 @@ impl StreamWorker2 {
 
                 if size > 0 {
                     if let Err(ref e) = tx.lock().unwrap().forward(dst, src, &buffer[..size]) {
-                        warn!("handle receive: {}: {} -> {}: {}", "TCP", dst, 0, e);
+                        warn!("handle receive: {}: {} -> {}: {}", "TCP", dst, src, e);
                     }
                 } else {
                     // Close
                     is_rx_closed_cloned.store(true, Ordering::Relaxed);
-                    trace!("close stream RX {} -> {}", dst, 0);
+                    trace!("close stream RX {} -> {}", dst, src);
 
                     if let Err(ref e) = tx.lock().unwrap().close(dst, src) {
-                        warn!("handle close: {}: {} -> {}: {}", "TCP", dst, 0, e);
+                        warn!("handle close: {}: {} -> {}: {}", "TCP", dst, src, e);
                     }
 
                     break;
@@ -536,14 +539,15 @@ impl StreamWorker2 {
                     if e.kind() == io::ErrorKind::NotFound {
                         return;
                     }
-                    warn!("handle timeout: {}: {} -> {}: {}", "TCP", dst, 0, e);
+                    warn!("handle timeout: {}: {} -> {}: {}", "TCP", dst, src, e);
                 }
             }
         });
 
-        trace!("open stream {} -> {}", 0, dst);
+        trace!("open stream {} -> {}", src, dst);
 
         Ok(StreamWorker2 {
+            src,
             dst,
             stream_tx: Some(stream_tx),
             is_tx_closed,
@@ -562,7 +566,7 @@ impl StreamWorker2 {
         debug!(
             "send to proxy: {}: {} -> {} ({} Bytes)",
             "TCP",
-            "0",
+            self.src,
             self.dst,
             payload.len()
         );
@@ -577,7 +581,7 @@ impl StreamWorker2 {
                 if !self.is_tx_closed.load(Ordering::Relaxed) {
                     self.is_tx_closed.store(true, Ordering::Relaxed);
                     self.stream_tx.take().unwrap().forget();
-                    trace!("close stream TX {} -> {}", 0, self.dst);
+                    trace!("close stream TX {} -> {}", self.src, self.dst);
                 }
             }
             Shutdown::Read => {
@@ -611,7 +615,7 @@ impl StreamWorker2 {
 impl Drop for StreamWorker2 {
     fn drop(&mut self) {
         self.close();
-        trace!("drop stream {} -> {}", 0, self.dst);
+        trace!("drop stream {} -> {}", self.src, self.dst);
     }
 }
 

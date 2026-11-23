@@ -433,6 +433,15 @@ impl Forwarder {
         let state = self
             .get_state_mut(dst, src)
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        // SYN-ACK retransmissions must use the RTO timer, never incoming ACKs.
+        if state.cache_syn().is_some() {
+            if state.syn_retransmit_due() {
+                state.double_rto();
+                state.update_syn_timer();
+                self.send_tcp_ack_syn(dst, src)?;
+            }
+            return Ok(());
+        }
         let next_rto = state.next_rto();
         let payload = state.cache_mut().get_timed_out_and_update(next_rto);
         let sequence = state.cache().sequence();
@@ -504,12 +513,12 @@ impl Forwarder {
 
     /// Sends TCP packets from the queue.
     pub fn send_tcp(&mut self, dst: SocketAddrV4, src: SocketAddrV4) -> io::Result<()> {
-        // Retransmit unhandled SYN
+        // Retransmit outstanding SYN-ACK only from the periodic RTO timer.
         let state = self
             .get_state(dst, src)
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
         if state.cache_syn().is_some() {
-            return self.send_tcp_ack_syn(dst, src);
+            return Ok(());
         }
 
         if state.src_window() > 0 {
@@ -1218,6 +1227,7 @@ pub struct Redirector {
     tx: Arc<Mutex<Forwarder>>,
     src_ip_addr: Ipv4Network,
     local_ip_addr: Ipv4Addr,
+    interface_ip_addr: Ipv4Addr,
     gw_ip_addr: Option<Ipv4Addr>,
     proxy: ProxyConfig,
     streams: HashMap<(SocketAddrV4, SocketAddrV4), StreamWorker>,
@@ -1258,6 +1268,8 @@ impl Redirector {
     ) -> Redirector {
         let size = traffic.as_ref().map(|traffic| traffic.size());
         let count = traffic.as_ref().map(|traffic| traffic.count());
+        // Snapshot the actual interface IP before the virtual gateway overrides it.
+        let interface_ip_addr = tx.lock().unwrap().local_ip_addr;
         let (tcp_timeout_tx, tcp_timeout_rx) = mpsc::unbounded_channel();
         let (tcp_ready_tx, tcp_ready_rx) = mpsc::unbounded_channel();
         let (udp_ready_tx, udp_ready_rx) = mpsc::unbounded_channel();
@@ -1265,6 +1277,7 @@ impl Redirector {
             tx,
             src_ip_addr,
             local_ip_addr,
+            interface_ip_addr,
             gw_ip_addr,
             proxy,
             streams: HashMap::new(),
@@ -1295,6 +1308,14 @@ impl Redirector {
         }
 
         redirector
+    }
+
+    /// Let the host TCP/IP stack handle services bound to its actual address.
+    /// Do not bypass a remote WireGuard subnet: those destinations still proxy.
+    fn should_proxy_ipv4(&self, src: Ipv4Addr, dst: Ipv4Addr) -> bool {
+        src != self.local_ip_addr
+            && self.src_ip_addr.contains(src)
+            && dst != self.interface_ip_addr
     }
 
     /// Opens an `Interface` for redirection.
@@ -1508,7 +1529,7 @@ impl Redirector {
     async fn handle_ipv4(&mut self, indicator: &Indicator, frame: &[u8]) -> io::Result<()> {
         if let Some(ipv4) = indicator.ipv4() {
             let src = ipv4.src();
-            if src != self.local_ip_addr && self.src_ip_addr.contains(src) {
+            if self.should_proxy_ipv4(src, ipv4.dst()) {
                 let src = ipv4.src();
                 debug!(
                     "receive from pcap: {} ({} + {} Bytes)",
@@ -2102,6 +2123,40 @@ impl Redirector {
         if self.tx.lock().unwrap().set_src_hardware_addr(ip_addr, hardware_addr) {
             info!("Device {} ({}) joined or updated its address", ip_addr, hardware_addr);
         }
+    }
+}
+
+#[cfg(test)]
+mod local_destination_tests {
+    use super::*;
+
+    #[test]
+    fn host_service_is_not_proxied_but_wireguard_destination_is() {
+        let host = Ipv4Addr::new(192, 168, 1, 10);
+        let gateway = Ipv4Addr::new(192, 168, 1, 250);
+        let client = Ipv4Addr::new(192, 168, 1, 101);
+        let forwarder = Forwarder::new(
+            Box::new(pcap::BlackHole::new()),
+            1500,
+            pcap::HARDWARE_ADDR_UNSPECIFIED,
+            host,
+        );
+        let redirector = Redirector::new(
+            Arc::new(Mutex::new(forwarder)),
+            Ipv4Network::new(client, 32).unwrap(),
+            gateway,
+            Some(gateway),
+            ProxyConfig::new_socks(
+                SocketAddrV4::new(host, 1083), false, false, None,
+            ),
+            None,
+        );
+
+        assert_eq!(redirector.interface_ip_addr, host);
+        assert!(!redirector.should_proxy_ipv4(client, host));
+        assert!(redirector.should_proxy_ipv4(client, Ipv4Addr::new(192, 168, 2, 200)));
+        assert!(redirector.should_proxy_ipv4(client, Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!redirector.should_proxy_ipv4(Ipv4Addr::new(192, 168, 1, 102), host));
     }
 }
 

@@ -1022,6 +1022,12 @@ impl TcpTxState {
         self.cache_syn
     }
 
+    /// Whether an outstanding SYN-ACK is due for RTO-driven retransmission.
+    pub fn syn_retransmit_due(&self) -> bool {
+        self.cache_syn
+            .is_some_and(|sent| sent.elapsed() >= Duration::from_millis(self.rto))
+    }
+
     /// Returns the TCP FIN in the cache of the TCP connection.
     pub fn cache_fin(&self) -> Option<Timer> {
         self.cache_fin
@@ -1102,6 +1108,22 @@ mod stall_tests {
             None,
             1460,
         )
+    }
+
+    #[test]
+    fn syn_ack_retransmission_obeys_rto_backoff() {
+        let mut state = state();
+        state.update_syn_timer();
+        assert!(!state.syn_retransmit_due());
+
+        state.cache_syn = Some(Instant::now() - Duration::from_millis(state.rto() + 1));
+        assert!(state.syn_retransmit_due());
+
+        let previous_rto = state.rto();
+        state.double_rto();
+        state.update_syn_timer();
+        assert!(state.rto() > previous_rto);
+        assert!(!state.syn_retransmit_due());
     }
 
     #[test]
