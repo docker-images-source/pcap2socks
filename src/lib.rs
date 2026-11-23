@@ -8,7 +8,7 @@ use lru::LruCache;
 use rand::{self, Rng};
 use stat::Traffic;
 use std::cmp::{max, min};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -158,14 +158,13 @@ impl Forwarder {
     }
 
     /// Sets the source hardware address.
-    pub fn set_src_hardware_addr(&mut self, src_ip_addr: Ipv4Addr, hardware_addr: HardwareAddr) {
-        self.src_hardware_addr_map
-            .insert(src_ip_addr, hardware_addr);
-        trace!(
-            "set source hardware address of {} to {}",
-            src_ip_addr,
-            hardware_addr
-        );
+    pub fn set_src_hardware_addr(&mut self, src_ip_addr: Ipv4Addr, hardware_addr: HardwareAddr) -> bool {
+        if self.src_hardware_addr_map.get(&src_ip_addr) == Some(&hardware_addr) {
+            return false;
+        }
+        self.src_hardware_addr_map.insert(src_ip_addr, hardware_addr);
+        trace!("set source hardware address of {} to {}", src_ip_addr, hardware_addr);
+        true
     }
 
     /// Sets the local IP address.
@@ -1004,7 +1003,8 @@ impl Forwarder {
             if let Err(e) = indicator.serialize(&mut buffer[..size]) {
                 result = Some(e);
             }
-        });
+        })
+        .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "pcap transmit buffer unavailable"))??;
         match result {
             Some(e) => return Err(e),
             None => debug!("send to pcap: {} ({} Bytes)", indicator.brief(), size),
@@ -1034,7 +1034,7 @@ impl Forwarder {
                     result = Some(e);
                 }
             })
-            .unwrap_or(Ok(()))?;
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "pcap transmit buffer unavailable"))??;
         match result {
             Some(e) => return Err(e),
             None => debug!(
@@ -1181,7 +1181,6 @@ const UDP_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 /// Represents a channel redirect traffic to the proxy or loopback to the source in pcap.
 pub struct Redirector {
     tx: Arc<Mutex<Forwarder>>,
-    tx_src_hardware_addr_set_ip_addr_set: HashSet<Ipv4Addr>,
     src_ip_addr: Ipv4Network,
     local_ip_addr: Ipv4Addr,
     gw_ip_addr: Option<Ipv4Addr>,
@@ -1217,7 +1216,6 @@ impl Redirector {
         let (tcp_timeout_tx, tcp_timeout_rx) = mpsc::unbounded_channel();
         let redirector = Redirector {
             tx,
-            tx_src_hardware_addr_set_ip_addr_set: HashSet::new(),
             src_ip_addr,
             local_ip_addr,
             gw_ip_addr,
@@ -1939,13 +1937,8 @@ impl Redirector {
     }
 
     fn set_tx_hardware_addr(&mut self, ip_addr: Ipv4Addr, hardware_addr: HardwareAddr) {
-        if !self.tx_src_hardware_addr_set_ip_addr_set.contains(&ip_addr) {
-            self.tx
-                .lock()
-                .unwrap()
-                .set_src_hardware_addr(ip_addr, hardware_addr);
-            self.tx_src_hardware_addr_set_ip_addr_set.insert(ip_addr);
-            info!("Device {} ({}) joined the network", ip_addr, hardware_addr);
+        if self.tx.lock().unwrap().set_src_hardware_addr(ip_addr, hardware_addr) {
+            info!("Device {} ({}) joined or updated its address", ip_addr, hardware_addr);
         }
     }
 }
