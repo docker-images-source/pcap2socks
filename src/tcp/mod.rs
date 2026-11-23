@@ -594,7 +594,8 @@ impl TcpTxState {
         TcpTxState {
             src,
             dst,
-            src_window: (src_window as usize) << src_wscale.unwrap_or(0),
+            // Scale the peer's advertised window by the peer's factor.
+            src_window: (src_window as usize) << wscale.unwrap_or(0).min(14),
             src_wscale,
             sack_perm,
             sequence,
@@ -603,7 +604,7 @@ impl TcpTxState {
             sacks: None,
             delayed_ack: false,
             cache: Queue::with_capacity(
-                (RECV_WINDOW as usize) << wscale.unwrap_or(0) as usize,
+                min(MAX_QUEUE, (RECV_WINDOW as usize) << wscale.unwrap_or(0).min(14)),
                 sequence,
             ),
             cache_syn: None,
@@ -1152,10 +1153,14 @@ pub struct TcpRxState {
     duplicate: usize,
     last_retrans: Option<Instant>,
     wscale: u8,
+    recv_wscale: u8,
     sack_perm: bool,
     cache: Window,
     fin_sequence: Option<u32>,
 }
+
+/// Bound the receive-cache allocation even when the peer advertises a large scale.
+const MAX_RX_CACHE_WSCALE: u8 = 8;
 
 impl TcpRxState {
     /// Creates a new `TcpRxState`, the sequence is the sequence in the TCP SYN packet.
@@ -1164,6 +1169,7 @@ impl TcpRxState {
         dst: SocketAddrV4,
         sequence: u32,
         wscale: u8,
+        recv_wscale: u8,
         sack_perm: bool,
     ) -> TcpRxState {
         let recv_next = sequence.checked_add(1).unwrap_or(0);
@@ -1178,8 +1184,12 @@ impl TcpRxState {
             duplicate: 0,
             last_retrans: None,
             wscale,
+            recv_wscale,
             sack_perm,
-            cache: Window::with_capacity((RECV_WINDOW as usize) << wscale as usize, recv_next),
+            cache: Window::with_capacity(
+                (RECV_WINDOW as usize) << min(recv_wscale, MAX_RX_CACHE_WSCALE) as usize,
+                recv_next,
+            ),
             fin_sequence: None,
         }
     }
@@ -1294,6 +1304,11 @@ impl TcpRxState {
     /// Returns the window scale of the TCP connection.
     pub fn wscale(&self) -> u8 {
         self.wscale
+    }
+
+    /// Returns our advertised receive window scale.
+    pub fn recv_wscale(&self) -> u8 {
+        self.recv_wscale
     }
 
     /// Returns if the SACK is permitted of the TCP connection.

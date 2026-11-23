@@ -1475,7 +1475,8 @@ impl Redirector {
             // Pure TCP FIN
             self.handle_tcp_fin(tcp, payload)?;
         } else {
-            unreachable!();
+            // Flags come from the network and are not an internal invariant.
+            trace!("drop TCP segment with unsupported flags: {}", tcp.flag_string());
         }
 
         Ok(())
@@ -1543,7 +1544,7 @@ impl Redirector {
                             match stream.send(payload) {
                                 Ok(_) => {
                                     let cache_remaining_size = (state.cache().remaining()
-                                        >> state.wscale() as usize)
+                                        >> state.recv_wscale() as usize)
                                         as u16;
 
                                     state.add_recv_next(size as u32);
@@ -1577,7 +1578,7 @@ impl Redirector {
                         None => {
                             // Retransmission or unordered
                             let cache_remaining_size =
-                                (state.cache().remaining() >> state.wscale() as usize) as u16;
+                                (state.cache().remaining() >> state.recv_wscale() as usize) as u16;
 
                             // Update window size
                             let mut tx_locked = self.tx.lock().unwrap();
@@ -1677,13 +1678,18 @@ impl Redirector {
             self.clean_up(src, dst);
 
             // Admit SYN
+            // RFC 7323 limits TCP window scale to 14.
             let wscale = match ENABLE_WSCALE {
-                true => tcp.wscale(),
+                true => tcp.wscale().filter(|&scale| scale <= 14),
                 false => None,
             };
-            let recv_wscale = wscale.map(|wscale| min(wscale, MAX_RECV_WSCALE));
+            // Our advertised scale is independent of the peer's scale.
+            let recv_wscale = wscale.map(|_| MAX_RECV_WSCALE);
             let sack_perm = ENABLE_SACK && tcp.is_sack_perm();
-            let state = TcpRxState::new(src, dst, tcp.sequence(), wscale.unwrap_or(0), sack_perm);
+            let state = TcpRxState::new(
+                src, dst, tcp.sequence(), wscale.unwrap_or(0),
+                recv_wscale.unwrap_or(0), sack_perm,
+            );
 
             {
                 let mut tx_locked = self.tx.lock().unwrap();

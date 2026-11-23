@@ -353,15 +353,18 @@ impl Tcp {
             #[allow(clippy::single_match)]
             match packet.get_number() {
                 TcpOptionNumbers::SACK => {
-                    let mut vector = Vec::with_capacity(4);
-
-                    let pair_length = (buffer[1] as usize - 2) / 8;
-                    for i in 0..pair_length {
-                        let left = bytes_to_u32(&buffer[2 + 8 * i..2 + 8 * i + 4]);
-                        let right = bytes_to_u32(&buffer[2 + 8 * i + 4..2 + 8 * i + 8]);
+                    let length = buffer[1] as usize;
+                    // A SACK option contains 2 header bytes and 1..4 blocks of
+                    // eight bytes. Never index beyond the fixed option buffer.
+                    if !(10..=34).contains(&length) || (length - 2) % 8 != 0 {
+                        return None;
+                    }
+                    let mut vector = Vec::with_capacity((length - 2) / 8);
+                    for i in 0..(length - 2) / 8 {
+                        let left = bytes_to_u32(&buffer[2 + 8 * i..6 + 8 * i]);
+                        let right = bytes_to_u32(&buffer[6 + 8 * i..10 + 8 * i]);
                         vector.push((left, right));
                     }
-
                     return Some(vector);
                 }
                 _ => {}
