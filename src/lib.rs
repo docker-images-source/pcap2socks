@@ -13,7 +13,7 @@ use std::net::{Ipv4Addr, Shutdown, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io;
 use tokio::sync::mpsc;
 
@@ -1185,6 +1185,8 @@ const MAX_RECV_WSCALE: u8 = 8;
 
 /// Represents the max limit of UDP port for binding in local.
 const MAX_UDP_PORT: usize = 256;
+/// Represents the interval for reclaiming closed UDP associations.
+const UDP_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Represents a channel redirect traffic to the proxy or loopback to the source in pcap.
 pub struct Redirector {
@@ -1265,8 +1267,13 @@ impl Redirector {
         if self.gw_ip_addr.is_some() {
             self.tx.lock().unwrap().send_gratuitous_arp()?;
         }
+        let mut last_udp_cleanup = Instant::now();
 
         loop {
+            if last_udp_cleanup.elapsed() >= UDP_CLEANUP_INTERVAL {
+                self.prune_closed_udp_ports();
+                last_udp_cleanup = Instant::now();
+            }
             // Drop stale streams on the receiving task, which owns both state maps.
             // The pcap read timeout also wakes this loop on a quiet LAN.
             while let Ok((src, dst, id)) = self.tcp_timeout_rx.try_recv() {
@@ -1876,58 +1883,67 @@ impl Redirector {
     }
 
     async fn bind_local_udp_port(&mut self, src: SocketAddrV4) -> io::Result<u16> {
-        let local_port = self.datagram_map.get(&src);
-        match local_port {
-            Some(&local_port) => {
-                // Update LRU
-                self.udp_lru.get(&local_port);
-
-                Ok(local_port)
+        if let Some(&port) = self.datagram_map.get(&src) {
+            if self.datagrams.get(&port).is_some_and(|worker| !worker.is_closed())
+                && self.udp_lru.get(&port) == Some(&src)
+            {
+                return Ok(port);
             }
-            None => {
-                let bind_port = if self.udp_lru.len() < self.udp_lru.cap() {
-                    match DatagramWorker::bind(self.get_tx(), src, &self.proxy).await {
-                        Ok((worker, port)) => {
-                            self.datagrams.insert(port, worker);
+            // The cached SOCKS5 association has failed or its mapping is inconsistent.
+            self.unbind_local_udp_port(src);
+        }
+        self.prune_closed_udp_ports();
 
-                            // Update map and LRU
-                            self.datagram_map.insert(src, port);
-                            self.udp_lru.put(port, src);
-
-                            trace!("bind UDP port {} = {}", port, src);
-
-                            Ok(port)
-                        }
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    Err(io::Error::new(io::ErrorKind::Other, "cannot bind UDP port"))
-                };
-
-                match bind_port {
-                    Ok(port) => Ok(port),
-                    Err(e) => {
-                        if self.udp_lru.is_empty() {
-                            Err(e)
-                        } else {
-                            let pair = self.udp_lru.pop_lru().unwrap();
-                            let port = pair.0;
-                            let prev_src = pair.1;
-
-                            // Reuse
-                            self.datagram_map.remove(&prev_src);
-                            trace!("reuse UDP port {} = {} to {}", port, prev_src, src);
-                            self.datagram_map.insert(src, port);
-                            self.datagrams.get_mut(&port).unwrap().set_src(&src);
-
-                            // Update LRU
-                            self.udp_lru.put(port, src);
-
-                            Ok(port)
-                        }
-                    }
+        let bind_port = if self.udp_lru.len() < self.udp_lru.cap() {
+            match DatagramWorker::bind(self.get_tx(), src, &self.proxy).await {
+                Ok((worker, port)) => {
+                    self.datagrams.insert(port, worker);
+                    self.datagram_map.insert(src, port);
+                    self.udp_lru.put(port, src);
+                    trace!("bind UDP port {} = {}", port, src);
+                    Ok(port)
                 }
+                Err(e) => Err(e),
             }
+        } else {
+            Err(io::Error::new(io::ErrorKind::Other, "cannot bind UDP port"))
+        };
+
+        match bind_port {
+            Ok(port) => Ok(port),
+            Err(e) => {
+                // Keep the original port-reuse behavior when no new socket is available,
+                // but never reuse a worker whose SOCKS5 association is already closed.
+                while let Some((port, prev_src)) = self.udp_lru.pop_lru() {
+                    self.datagram_map.remove(&prev_src);
+                    if let Some(worker) = self.datagrams.get_mut(&port) {
+                        if !worker.is_closed() {
+                            trace!("reuse UDP port {} = {} to {}", port, prev_src, src);
+                            worker.set_src(&src);
+                            self.datagram_map.insert(src, port);
+                            self.udp_lru.put(port, src);
+                            return Ok(port);
+                        }
+                    }
+                    self.datagrams.remove(&port);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn prune_closed_udp_ports(&mut self) {
+        let closed: Vec<u16> = self
+            .datagrams
+            .iter()
+            .filter_map(|(&port, worker)| worker.is_closed().then_some(port))
+            .collect();
+        for port in closed {
+            if let Some(src) = self.udp_lru.pop(&port) {
+                self.datagram_map.remove(&src);
+                debug!("remove closed UDP association {} = {}", port, src);
+            }
+            self.datagrams.remove(&port);
         }
     }
 
