@@ -588,8 +588,11 @@ impl DatagramWorker {
         let a_src_cloned = Arc::clone(&a_src);
         let is_closed = Arc::new(AtomicBool::new(false));
         let is_closed_cloned = Arc::clone(&is_closed);
+        let is_closed_tx = Arc::clone(&is_closed);
         let (close_tx, mut close_rx) = mpsc::channel(1);
         let (close_tx2, mut close_rx2) = mpsc::channel(1);
+        let close_receiver = close_tx2.clone();
+        let close_sender = close_tx.clone();
 
         // Send
         tokio::spawn(async move {
@@ -612,14 +615,15 @@ impl DatagramWorker {
                                             "send to proxy: {}: {} -> {} ({} Bytes)",
                                             "UDP", local_port, dst, size
                                         );
+                                        is_close = false;
                                     },
                                     Err(ref e) => {
                                         warn!("handle send: {}: {} -> {}: {}", "UDP", local_port, dst, e);
+                                        is_close = true;
                                     }
                                 }
-                                is_close = false;
                             }
-                            None => is_close = false
+                            None => is_close = true
                         },
                         _ = close_rx_fut => is_close = true
                     }
@@ -630,6 +634,8 @@ impl DatagramWorker {
                     break;
                 }
             }
+            is_closed_tx.store(true, Ordering::Relaxed);
+            let _ = close_receiver.try_send(());
         });
 
         // Receive
@@ -637,6 +643,7 @@ impl DatagramWorker {
             let mut buffer = vec![0u8; u16::MAX as usize];
             loop {
                 let size;
+                let mut closed = false;
                 let mut addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
 
                 // Select
@@ -673,14 +680,18 @@ impl DatagramWorker {
                                     );
 
                                     size = 0;
+                                    closed = true;
                                 }
                             }
                         }
-                        _ = close_rx_fut => size = 0
+                        _ = close_rx_fut => {
+                            size = 0;
+                            closed = true;
+                        }
                     };
                 }
 
-                if size > 0 {
+                if !closed && size > 0 {
                     // Send
                     if let Err(ref e) = tx.lock().unwrap().forward(
                         addr,
@@ -692,8 +703,9 @@ impl DatagramWorker {
                             "UDP", addr, local_port, e
                         );
                     }
-                } else {
+                } else if closed {
                     is_closed_cloned.store(true, Ordering::Relaxed);
+                    let _ = close_sender.try_send(());
                     trace!(
                         "close datagram {} = {}",
                         local_port,
@@ -722,6 +734,9 @@ impl DatagramWorker {
 
     /// Sends data on the proxied datagram in UDP to the destination.
     pub fn send_to(&mut self, payload: Vec<u8>, dst: SocketAddrV4) -> io::Result<()> {
+        if self.is_closed() {
+            return Err(io::Error::from(io::ErrorKind::NotConnected));
+        }
         // Send
         if self.tx_tx.send((payload, dst)).is_err() {
             return Err(io::Error::from(io::ErrorKind::NotConnected));

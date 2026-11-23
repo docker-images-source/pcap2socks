@@ -79,6 +79,22 @@ const HEADER_SIZE: usize = RSV_SIZE + FRAG_SIZE + ATYP_SIZE + DST_ADDR_SIZE + DS
 
 const ATYP_IPV4: u8 = 1;
 
+fn parse_udp_source(datagram: &[u8]) -> Option<SocketAddrV4> {
+    if datagram.len() < HEADER_SIZE
+        || datagram[0] != 0
+        || datagram[1] != 0
+        || datagram[2] != 0
+        || datagram[3] != ATYP_IPV4
+    {
+        return None;
+    }
+
+    Some(SocketAddrV4::new(
+        Ipv4Addr::new(datagram[4], datagram[5], datagram[6], datagram[7]),
+        u16::from_be_bytes([datagram[8], datagram[9]]),
+    ))
+}
+
 /// Represents the send half of a SOCKS5 UDP client.
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -131,28 +147,59 @@ impl SocksRecvHalf {
         }
     }
 
-    /// Receives a single datagram message on the socket.
+    /// Receives UDP packets and detects closure of the SOCKS5 control connection.
     pub async fn recv_from(&mut self, buffer: &mut [u8]) -> io::Result<(usize, SocketAddrV4)> {
-        let n = self.socket.recv(&mut self.buffer).await?;
-        // ATYP and address
-        match self.buffer[3] {
-            ATYP_IPV4 => {}
-            _ => unreachable!(),
-        }
-        let addr = SocketAddrV4::new(
-            Ipv4Addr::new(
-                self.buffer[4],
-                self.buffer[5],
-                self.buffer[6],
-                self.buffer[7],
-            ),
-            self.buffer[8] as u16 * 256 + self.buffer[9] as u16,
-        );
-        // Buffer
-        let size = n - HEADER_SIZE;
-        buffer[..size].copy_from_slice(&self.buffer[HEADER_SIZE..n]);
+        loop {
+            let n = tokio::select! {
+                result = self.socket.recv(&mut self.buffer) => result?,
+                result = self.stream.get_ref().readable() => {
+                    result?;
+                    let mut byte = [0u8; 1];
+                    match self.stream.get_ref().try_read(&mut byte) {
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                        Err(e) => return Err(e),
+                        Ok(_) => return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "SOCKS5 UDP association control connection closed",
+                        )),
+                    }
+                }
+            };
 
-        Ok((size, addr))
+            let addr = match parse_udp_source(&self.buffer[..n]) {
+                Some(addr) => addr,
+                None => {
+                    trace!("drop invalid SOCKS5 UDP datagram");
+                    continue;
+                }
+            };
+            let size = n - HEADER_SIZE;
+            if size > buffer.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "UDP buffer too small"));
+            }
+            buffer[..size].copy_from_slice(&self.buffer[HEADER_SIZE..n]);
+            return Ok((size, addr));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_udp_source_validates_header() {
+        let valid = [0, 0, 0, ATYP_IPV4, 1, 2, 3, 4, 0x12, 0x34];
+        assert_eq!(
+            parse_udp_source(&valid),
+            Some(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 0x1234))
+        );
+        assert_eq!(parse_udp_source(&valid[..9]), None);
+        for index in 0..4 {
+            let mut invalid = valid;
+            invalid[index] = 0xff;
+            assert_eq!(parse_udp_source(&invalid), None);
+        }
     }
 }
 
