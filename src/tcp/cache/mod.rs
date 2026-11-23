@@ -521,6 +521,12 @@ impl Window {
             (sequence, payload, sub_sequence)
         };
 
+        // A duplicate entirely before recv_next has no data left after trimming.
+        // Do not insert a zero-length range or take modulo a zero-length buffer.
+        if payload.is_empty() {
+            return Ok(None);
+        }
+
         let size = sub_sequence + payload.len();
         if size > self.capacity {
             return Err(Error::new(ErrorKind::Other, "window is full"));
@@ -806,6 +812,40 @@ impl Display for Window {
 fn window_new() {
     let w = Window::with_capacity(0, 0);
     assert_eq!(w.to_string(), "[]");
+}
+
+#[test]
+fn window_ignores_expired_segment_before_initial_allocation() {
+    let mut window = Window::with_capacity(64, 100);
+    assert_eq!(window.append(99, &[42]).unwrap(), None);
+    assert!(window.buffer.is_empty());
+    assert!(window.edges.is_empty());
+    assert_eq!(window.sequence(), 100);
+    assert_eq!(window.append(100, &[1, 2, 3]).unwrap(), Some(vec![1, 2, 3]));
+}
+
+#[test]
+fn window_ignores_expired_segment_across_sequence_wrap() {
+    let mut window = Window::with_capacity(64, 0);
+    assert_eq!(window.append(u32::MAX, &[42]).unwrap(), None);
+    assert!(window.buffer.is_empty());
+    assert_eq!(window.append(0, &[1, 2]).unwrap(), Some(vec![1, 2]));
+}
+
+#[test]
+fn window_keeps_unexpired_suffix_of_overlap() {
+    let mut window = Window::with_capacity(64, 100);
+    assert_eq!(window.append(98, &[8, 9, 10]).unwrap(), Some(vec![10]));
+    assert_eq!(window.sequence(), 101);
+}
+
+#[test]
+fn window_ignores_empty_payload_without_allocating() {
+    let mut window = Window::with_capacity(64, 100);
+    assert_eq!(window.append(100, &[]).unwrap(), None);
+    assert!(window.buffer.is_empty());
+    assert!(window.edges.is_empty());
+    assert_eq!(window.append(100, &[9]).unwrap(), Some(vec![9]));
 }
 
 #[test]
