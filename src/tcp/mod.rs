@@ -701,18 +701,16 @@ impl TcpTxState {
         let mut rtt = None;
         let mut progressed = false;
 
-        // SYN
+        // SYN occupies exactly one sequence number.
         if let Some(instant) = self.cache_syn {
             let send_next = self.sequence;
-            if sequence
-                .checked_sub(send_next)
-                .unwrap_or_else(|| sequence + (u32::MAX - send_next)) as usize
-                <= MAX_U32_WINDOW_SIZE
-            {
+            if sequence == send_next.wrapping_add(1) {
                 rtt = Some(instant.elapsed());
 
                 self.cache_syn = None;
                 progressed = true;
+                // SYN consumes one byte in the sequence space of the data cache.
+                self.cache.invalidate_to(sequence);
                 trace!("acknowledge TCP SYN of {} -> {}", self.dst, self.src);
 
                 // Update TCP sequence
@@ -720,14 +718,19 @@ impl TcpTxState {
             }
         }
 
-        // ACK
-        let sub_sequence = sequence
-            .checked_sub(self.cache.sequence())
-            .unwrap_or_else(|| sequence + (u32::MAX - self.cache.sequence()));
-        if sub_sequence > 0 && sub_sequence as usize <= MAX_U32_WINDOW_SIZE {
-            // Invalidate cache
+        // ACK of payload and FIN also acknowledges the pending data.
+        let data_ack = if self.cache_fin.is_some()
+            && sequence == self.cache.recv_next().wrapping_add(1)
+        {
+            self.cache.recv_next()
+        } else {
+            sequence
+        };
+        let sub_sequence = data_ack.wrapping_sub(self.cache.sequence());
+        if sub_sequence > 0 && sub_sequence as usize <= self.cache.len() {
+            // Invalidate only bytes actually sent.
             let old_size = self.cache.len();
-            let cache_rtt = self.cache.invalidate_to(sequence);
+            let cache_rtt = self.cache.invalidate_to(data_ack);
             progressed |= self.cache.len() < old_size;
             if rtt.is_none() {
                 rtt = cache_rtt;
@@ -748,14 +751,9 @@ impl TcpTxState {
             }
         }
 
-        // FIN
+        // FIN is acknowledged only when its own sequence number is covered.
         if let Some(timer) = self.cache_fin {
-            if sequence
-                .checked_sub(self.cache.recv_next())
-                .unwrap_or_else(|| sequence + (u32::MAX - self.cache.recv_next()))
-                as usize
-                <= MAX_U32_WINDOW_SIZE
-            {
+            if sequence == self.cache.recv_next().wrapping_add(1) {
                 if rtt.is_none() && !self.cache_fin_retrans && !timer.is_timedout() {
                     rtt = Some(timer.elapsed());
                 }
@@ -1103,6 +1101,28 @@ mod stall_tests {
         state.last_ack_progress = Instant::now() - MAX_UNACKNOWLEDGED_TIME;
         state.acknowledge(100);
         assert!(state.is_stalled());
+    }
+
+    #[test]
+    fn syn_ack_advances_send_cache_before_data() {
+        let mut state = state();
+        state.update_syn_timer();
+        state.acknowledge(101);
+        assert!(state.cache_syn().is_none());
+        assert_eq!(state.cache().sequence(), 101);
+        state.append_queue(&[1, 2, 3]);
+        state.append_cache(3).unwrap();
+        state.acknowledge(104);
+        assert_eq!(state.cache().len(), 0);
+    }
+
+    #[test]
+    fn future_ack_does_not_discard_unsent_data() {
+        let mut state = state();
+        state.append_queue(&[1, 2, 3]);
+        state.append_cache(3).unwrap();
+        state.acknowledge(104);
+        assert_eq!(state.cache().len(), 3);
     }
 
     #[test]

@@ -1901,47 +1901,28 @@ impl Redirector {
             {
                 return Ok(port);
             }
-            // The cached SOCKS5 association has failed or its mapping is inconsistent.
             self.unbind_local_udp_port(src);
         }
         self.prune_closed_udp_ports();
 
-        let bind_port = if self.udp_lru.len() < self.udp_lru.cap() {
-            match DatagramWorker::bind(self.get_tx(), src, &self.proxy).await {
-                Ok((worker, port)) => {
-                    self.datagrams.insert(port, worker);
-                    self.datagram_map.insert(src, port);
-                    self.udp_lru.put(port, src);
-                    trace!("bind UDP port {} = {}", port, src);
-                    Ok(port)
-                }
-                Err(e) => Err(e),
-            }
-        } else {
-            Err(io::Error::new(io::ErrorKind::Other, "cannot bind UDP port"))
-        };
-
-        match bind_port {
-            Ok(port) => Ok(port),
-            Err(e) => {
-                // Keep the original port-reuse behavior when no new socket is available,
-                // but never reuse a worker whose SOCKS5 association is already closed.
-                while let Some((port, prev_src)) = self.udp_lru.pop_lru() {
-                    self.datagram_map.remove(&prev_src);
-                    if let Some(worker) = self.datagrams.get_mut(&port) {
-                        if !worker.is_closed() {
-                            trace!("reuse UDP port {} = {} to {}", port, prev_src, src);
-                            worker.set_src(&src);
-                            self.datagram_map.insert(src, port);
-                            self.udp_lru.put(port, src);
-                            return Ok(port);
-                        }
-                    }
-                    self.datagrams.remove(&port);
-                }
-                Err(e)
+        // Never reassign an active SOCKS5 association to a different source.
+        // Create a fresh association first: a failed bind must not destroy a live one.
+        let (worker, port) = DatagramWorker::bind(self.get_tx(), src, &self.proxy).await?;
+        if self.datagrams.contains_key(&port) {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "duplicate UDP socket port"));
+        }
+        if self.udp_lru.len() >= self.udp_lru.cap() {
+            if let Some((old_port, old_src)) = self.udp_lru.pop_lru() {
+                self.datagram_map.remove(&old_src);
+                self.datagrams.remove(&old_port);
+                trace!("evict UDP association {} = {}", old_port, old_src);
             }
         }
+        self.datagrams.insert(port, worker);
+        self.datagram_map.insert(src, port);
+        self.udp_lru.put(port, src);
+        trace!("bind UDP port {} = {}", port, src);
+        Ok(port)
     }
 
     fn prune_closed_udp_ports(&mut self) {
