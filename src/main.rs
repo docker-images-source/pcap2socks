@@ -285,16 +285,14 @@ impl Logger {
         let fmt = |buf: &mut Formatter, record: &Record| {
             let mut style = buf.style();
 
-            let level = match &record.level() {
-                Level::Error => style.set_bold(true).set_color(Color::Red).value("error: "),
-                Level::Warn => style
-                    .set_bold(true)
-                    .set_color(Color::Yellow)
-                    .value("warning: "),
-                Level::Info => style.set_bold(true).set_color(Color::Green).value(""),
-                _ => style.set_color(Color::Rgb(165, 165, 165)).value(""),
+            let level = match record.level() {
+                Level::Error => style.set_bold(true).set_color(Color::Red).value("ERROR"),
+                Level::Warn => style.set_bold(true).set_color(Color::Yellow).value("WARN "),
+                Level::Info => style.set_bold(true).set_color(Color::Green).value("INFO "),
+                Level::Debug => style.set_color(Color::Rgb(165, 165, 165)).value("DEBUG"),
+                Level::Trace => style.set_color(Color::Rgb(165, 165, 165)).value("TRACE"),
             };
-            writeln!(buf, "{}{}", level, record.args())
+            writeln!(buf, "[{}] {} {}", buf.timestamp_millis(), level, record.args())
         };
 
         let stderr_logger = env_logger::builder()
