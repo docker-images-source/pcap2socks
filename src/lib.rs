@@ -8,7 +8,7 @@ use lru::LruCache;
 use rand::{self, Rng};
 use stat::Traffic;
 use std::cmp::{max, min};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1183,6 +1183,13 @@ const UDP_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 /// Avoid unbounded TCP stream and related cache proliferation.
 const MAX_TCP_STREAMS: usize = 256;
+/// Bound proxy handshakes and buffered initial UDP datagrams.
+const MAX_PENDING_TCP_CONNECTS: usize = 64;
+const MAX_PENDING_UDP_ASSOCIATIONS: usize = 64;
+const MAX_PENDING_UDP_DATAGRAMS: usize = 32;
+
+type TcpReady = (SocketAddrV4, SocketAddrV4, u64, io::Result<tokio::net::TcpStream>);
+type UdpReady = (SocketAddrV4, u64, io::Result<(DatagramWorker, u16)>);
 
 /// Represents a channel redirect traffic to the proxy or loopback to the source in pcap.
 pub struct Redirector {
@@ -1197,6 +1204,13 @@ pub struct Redirector {
     next_stream_id: u64,
     tcp_timeout_tx: mpsc::UnboundedSender<TcpTimeout>,
     tcp_timeout_rx: mpsc::UnboundedReceiver<TcpTimeout>,
+    tcp_ready_tx: mpsc::UnboundedSender<TcpReady>,
+    tcp_ready_rx: mpsc::UnboundedReceiver<TcpReady>,
+    pending_tcp: HashMap<(SocketAddrV4, SocketAddrV4), (u64, tokio::task::JoinHandle<()>)>,
+    udp_ready_tx: mpsc::UnboundedSender<UdpReady>,
+    udp_ready_rx: mpsc::UnboundedReceiver<UdpReady>,
+    pending_udp: HashMap<SocketAddrV4, (u64, VecDeque<(Vec<u8>, SocketAddrV4)>)>,
+    next_udp_id: u64,
     datagrams: HashMap<u16, DatagramWorker>,
     /// Represents the map mapping a source port to a local port.
     datagram_map: HashMap<SocketAddrV4, u16>,
@@ -1220,6 +1234,8 @@ impl Redirector {
         let size = traffic.as_ref().map(|traffic| traffic.size());
         let count = traffic.as_ref().map(|traffic| traffic.count());
         let (tcp_timeout_tx, tcp_timeout_rx) = mpsc::unbounded_channel();
+        let (tcp_ready_tx, tcp_ready_rx) = mpsc::unbounded_channel();
+        let (udp_ready_tx, udp_ready_rx) = mpsc::unbounded_channel();
         let redirector = Redirector {
             tx,
             src_ip_addr,
@@ -1232,6 +1248,13 @@ impl Redirector {
             next_stream_id: 0,
             tcp_timeout_tx,
             tcp_timeout_rx,
+            tcp_ready_tx,
+            tcp_ready_rx,
+            pending_tcp: HashMap::new(),
+            udp_ready_tx,
+            udp_ready_rx,
+            pending_udp: HashMap::new(),
+            next_udp_id: 0,
             datagrams: HashMap::new(),
             datagram_map: HashMap::new(),
             udp_lru: LruCache::new(MAX_UDP_PORT),
@@ -1287,6 +1310,8 @@ impl Redirector {
                 }
             }
 
+            self.poll_connect_results();
+
             // Monitor
             if let Some(is_running) = &is_running {
                 if !is_running.load(Ordering::Relaxed) {
@@ -1325,6 +1350,80 @@ impl Redirector {
                 }
             };
         }
+    }
+
+    /// Accept completed proxy handshakes on the task that owns TCP/UDP maps.
+    fn poll_connect_results(&mut self) {
+        while let Ok((src, dst, id, result)) = self.tcp_ready_rx.try_recv() {
+            let key = (src, dst);
+            if self.pending_tcp.get(&key).map(|(generation, _)| *generation) != Some(id) {
+                continue;
+            }
+            self.pending_tcp.remove(&key);
+            match result {
+                Ok(stream) => {
+                    let worker = StreamWorker::from_connected(
+                        self.get_tx(), src, dst, stream,
+                        Some((self.tcp_timeout_tx.clone(), id)),
+                    );
+                    match worker {
+                        Ok(worker) => {
+                            self.stream_ids.insert(key, id);
+                            self.streams.insert(key, worker);
+                        }
+                        Err(e) => self.fail_tcp_connect(src, dst, e),
+                    }
+                }
+                Err(e) => self.fail_tcp_connect(src, dst, e),
+            }
+        }
+
+        while let Ok((src, id, result)) = self.udp_ready_rx.try_recv() {
+            if self.pending_udp.get(&src).map(|(generation, _)| *generation) != Some(id) {
+                continue;
+            }
+            let (_, pending) = self.pending_udp.remove(&src).unwrap();
+            match result {
+                Ok((worker, port)) => {
+                    self.prune_closed_udp_ports();
+                    if self.datagrams.contains_key(&port) || self.udp_lru.len() >= self.udp_lru.cap() {
+                        debug!("discard UDP association at capacity or duplicate port: {}", src);
+                        continue;
+                    }
+                    self.datagrams.insert(port, worker);
+                    self.datagram_map.insert(src, port);
+                    self.udp_lru.put(port, src);
+                    for (payload, dst) in pending {
+                        if let Some(worker) = self.datagrams.get_mut(&port) {
+                            if let Err(e) = worker.send_to(payload, dst) {
+                                if e.kind() != io::ErrorKind::WouldBlock {
+                                    warn!("queue UDP packet to proxy: {}", e);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => warn!("create UDP SOCKS association for {}: {}", src, e),
+            }
+        }
+    }
+
+    fn fail_tcp_connect(&mut self, src: SocketAddrV4, dst: SocketAddrV4, error: io::Error) {
+        warn!("SOCKS TCP connect {} -> {} failed: {}", src, dst, error);
+        let reset = {
+            let mut forwarder = self.tx.lock().unwrap();
+            if let Some(state) = forwarder.get_state_mut(dst, src) {
+                state.add_acknowledgement(1);
+                forwarder.send_tcp_ack_rst(dst, src)
+            } else {
+                Ok(())
+            }
+        };
+        if let Err(e) = reset {
+            warn!("send TCP reset after proxy connect failure: {}", e);
+        }
+        self.clean_up(src, dst);
     }
 
     fn handle_arp(&mut self, indicator: &Indicator) -> io::Result<()> {
@@ -1663,11 +1762,12 @@ impl Redirector {
         let src = SocketAddrV4::new(tcp.src_ip_addr(), tcp.src());
         let dst = SocketAddrV4::new(tcp.dst_ip_addr(), tcp.dst());
         let key = (src, dst);
-        let is_exist = self.streams.get(&key).is_some();
+        let is_exist = self.streams.contains_key(&key) || self.pending_tcp.contains_key(&key);
 
         // Connect if not connected, drop if established
         if !is_exist {
-            if self.streams.len() >= MAX_TCP_STREAMS {
+            if self.streams.len() + self.pending_tcp.len() >= MAX_TCP_STREAMS
+                || self.pending_tcp.len() >= MAX_PENDING_TCP_CONNECTS {
                 // Do not evict an unrelated live connection to make room.
                 debug!("drop TCP SYN at active connection limit: {} -> {}", src, dst);
                 return Ok(());
@@ -1717,43 +1817,17 @@ impl Redirector {
                 tx_locked.set_state(dst, src, tx_state);
             }
 
-            // Connect
+            // Connect asynchronously. Only the owner loop can install a result.
             self.next_stream_id = self.next_stream_id.wrapping_add(1);
             let stream_id = self.next_stream_id;
-            let stream = StreamWorker::connect_with_cleanup(
-                self.get_tx(),
-                src,
-                dst,
-                &self.proxy,
-                Some((self.tcp_timeout_tx.clone(), stream_id)),
-            )
-            .await;
-
-            let stream = match stream {
-                Ok(stream) => stream,
-                Err(e) => {
-                    {
-                        let mut tx_locked = self.tx.lock().unwrap();
-                        let tx_state = tx_locked
-                            .get_state_mut(dst, src)
-                            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-
-                        tx_state.add_acknowledgement(1);
-
-                        // Send ACK/RST
-                        tx_locked.send_tcp_ack_rst(dst, src)?;
-                    }
-
-                    // Clean up
-                    self.clean_up(src, dst);
-
-                    return Err(e);
-                }
-            };
-
             self.states.insert(key, state);
-            self.stream_ids.insert(key, stream_id);
-            self.streams.insert(key, stream);
+            let sender = self.tcp_ready_tx.clone();
+            let proxy = self.proxy.clone();
+            let handle = tokio::spawn(async move {
+                let result = proxy.connect_tcp(dst).await;
+                let _ = sender.send((src, dst, stream_id, result));
+            });
+            self.pending_tcp.insert(key, (stream_id, handle));
         }
 
         Ok(())
@@ -1871,6 +1945,9 @@ impl Redirector {
     fn clean_up(&mut self, src: SocketAddrV4, dst: SocketAddrV4) {
         let key = (src, dst);
 
+        if let Some((_, handle)) = self.pending_tcp.remove(&key) {
+            handle.abort();
+        }
         self.stream_ids.remove(&key);
         self.streams.remove(&key);
         self.states.remove(&key);
@@ -1880,49 +1957,44 @@ impl Redirector {
 
     async fn handle_udp(&mut self, udp: &Udp, payload: &[u8]) -> io::Result<()> {
         let src = SocketAddrV4::new(udp.src_ip_addr(), udp.src());
-
-        // Bind
-        let port = self.bind_local_udp_port(src).await?;
-
-        // Send
-        self.datagrams
-            .get_mut(&port)
-            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?
-            .send_to(
-                payload.to_vec(),
-                SocketAddrV4::new(udp.dst_ip_addr(), udp.dst()),
-            )?;
-
-        Ok(())
-    }
-
-    async fn bind_local_udp_port(&mut self, src: SocketAddrV4) -> io::Result<u16> {
+        let dst = SocketAddrV4::new(udp.dst_ip_addr(), udp.dst());
         if let Some(&port) = self.datagram_map.get(&src) {
             if self.datagrams.get(&port).is_some_and(|worker| !worker.is_closed())
                 && self.udp_lru.get(&port) == Some(&src)
             {
-                return Ok(port);
+                let result = self.datagrams.get_mut(&port).unwrap().send_to(payload.to_vec(), dst);
+                // UDP is lossy by design: a full bounded channel drops this datagram.
+                match result {
+                    Ok(()) => return Ok(()),
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(_) => {},
+                }
             }
             self.unbind_local_udp_port(src);
         }
-        self.prune_closed_udp_ports();
-
-        // Never reassign an active SOCKS5 association to a different source.
-        // Create a fresh association first: a failed bind must not destroy a live one.
-        let (worker, port) = DatagramWorker::bind(self.get_tx(), src, &self.proxy).await?;
-        if self.datagrams.contains_key(&port) {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "duplicate UDP socket port"));
+        if let Some((_, queued)) = self.pending_udp.get_mut(&src) {
+            if queued.len() < MAX_PENDING_UDP_DATAGRAMS {
+                queued.push_back((payload.to_vec(), dst));
+            }
+            return Ok(());
         }
-        if self.udp_lru.len() >= self.udp_lru.cap() {
-            // A live association must never be stolen or evicted on a bind.
-            return Err(io::Error::new(io::ErrorKind::WouldBlock,
-                "UDP association capacity reached"));
+        if self.pending_udp.len() >= MAX_PENDING_UDP_ASSOCIATIONS
+            || self.udp_lru.len() >= self.udp_lru.cap() {
+            return Ok(());
         }
-        self.datagrams.insert(port, worker);
-        self.datagram_map.insert(src, port);
-        self.udp_lru.put(port, src);
-        trace!("bind UDP port {} = {}", port, src);
-        Ok(port)
+        self.next_udp_id = self.next_udp_id.wrapping_add(1);
+        let id = self.next_udp_id;
+        let sender = self.udp_ready_tx.clone();
+        let proxy = self.proxy.clone();
+        let forwarder = self.get_tx();
+        tokio::spawn(async move {
+            let result = DatagramWorker::bind(forwarder, src, &proxy).await;
+            let _ = sender.send((src, id, result));
+        });
+        let mut pending = VecDeque::new();
+        pending.push_back((payload.to_vec(), dst));
+        self.pending_udp.insert(src, (id, pending));
+        Ok(())
     }
 
     fn prune_closed_udp_ports(&mut self) {

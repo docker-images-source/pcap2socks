@@ -17,12 +17,21 @@ use socks::{SocksAuth, SocksOption};
 pub(crate) type TcpTimeout = (SocketAddrV4, SocketAddrV4, u64);
 
 /// Represents the configuration of the proxy.
+#[derive(Clone)]
 pub enum ProxyConfig {
     /// Represents the SOCKS proxy configuration.
     Socks(SocketAddrV4, SocksOption),
 }
 
 impl ProxyConfig {
+    /// Performs the potentially slow SOCKS handshake without holding the packet loop.
+    pub(crate) async fn connect_tcp(&self, dst: SocketAddrV4) -> io::Result<tokio::net::TcpStream> {
+        match self {
+            ProxyConfig::Socks(remote, options) =>
+                Ok(socks::connect(*remote, dst, options).await?.into_inner()),
+        }
+    }
+
     /// Creates a new SOCKS `ProxyConfig`.
     pub fn new_socks(
         remote: SocketAddrV4,
@@ -107,17 +116,22 @@ impl StreamWorker {
         proxy: &ProxyConfig,
         timeout: Option<(UnboundedSender<TcpTimeout>, u64)>,
     ) -> io::Result<StreamWorker> {
-        let tx_cloned = Arc::clone(&tx);
+        let stream = proxy.connect_tcp(dst).await?;
+        Self::from_connected(tx, src, dst, stream, timeout)
+    }
 
-        let stream = match proxy {
-            ProxyConfig::Socks(remote, options) => {
-                socks::connect(*remote, dst, options).await?
-            }
-        };
-        let stream = stream.into_inner();
+    /// Starts protocol handling only after the SOCKS handshake has completed.
+    pub(crate) fn from_connected(
+        tx: Arc<Mutex<dyn ForwardStream>>,
+        src: SocketAddrV4,
+        dst: SocketAddrV4,
+        stream: tokio::net::TcpStream,
+        timeout: Option<(UnboundedSender<TcpTimeout>, u64)>,
+    ) -> io::Result<StreamWorker> {
+        let tx_cloned = Arc::clone(&tx);
         let (mut stream_rx, mut stream_tx) = stream.into_split();
 
-        // Open
+        // Open only on the redirector's owner task; never on a stale connector.
         tx.lock().unwrap().open(dst, src)?;
 
         let (tx_tx, mut tx_rx): (UnboundedSender<Vec<u8>>, UnboundedReceiver<Vec<u8>>) =
