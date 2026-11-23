@@ -23,15 +23,19 @@ impl CacheBudget {
         CacheBudget { used: AtomicUsize::new(0), limit }
     }
 
-    fn reserve(&self, bytes: usize) -> Result<()> {
+    pub(crate) fn reserve(&self, bytes: usize) -> Result<()> {
         self.used.try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
             used.checked_add(bytes).filter(|&next| next <= self.limit)
-        }).map_err(|_| Error::new(ErrorKind::OutOfMemory, "TCP receive cache budget exceeded"))?;
+        }).map_err(|_| Error::new(ErrorKind::OutOfMemory, "TCP cache budget exceeded"))?;
         Ok(())
     }
 
-    fn release(&self, bytes: usize) {
+    pub(crate) fn release(&self, bytes: usize) {
         self.used.fetch_sub(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn remaining(&self) -> usize {
+        self.limit.saturating_sub(self.used.load(Ordering::Relaxed))
     }
 }
 

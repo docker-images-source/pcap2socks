@@ -332,7 +332,7 @@ impl Forwarder {
         let state = self
             .get_state_mut(dst, src)
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-        state.append_queue(payload);
+        state.append_queue(payload)?;
 
         self.send_tcp(dst, src)
     }
@@ -1194,6 +1194,8 @@ const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const MAX_TCP_STREAMS: usize = 256;
 /// Shared limit on the actual growable TCP receive-window byte buffers.
 const MAX_GLOBAL_TCP_RX_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// Shared bound on outstanding TCP payload in outbound queues and caches.
+const MAX_GLOBAL_TCP_TX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// Bound proxy handshakes and buffered initial UDP datagrams.
 const MAX_PENDING_TCP_CONNECTS: usize = 64;
 const MAX_PENDING_UDP_ASSOCIATIONS: usize = 64;
@@ -1229,6 +1231,7 @@ pub struct Redirector {
     pending_tcp: HashMap<(SocketAddrV4, SocketAddrV4), (u64, tokio::task::JoinHandle<()>)>,
     tcp_queued_bytes: Arc<AtomicUsize>,
     tcp_rx_cache_budget: Arc<CacheBudget>,
+    tcp_tx_cache_budget: Arc<CacheBudget>,
     udp_ready_tx: mpsc::UnboundedSender<UdpReady>,
     udp_ready_rx: mpsc::UnboundedReceiver<UdpReady>,
     pending_udp: HashMap<SocketAddrV4, PendingUdpAssociation>,
@@ -1275,6 +1278,7 @@ impl Redirector {
             pending_tcp: HashMap::new(),
             tcp_queued_bytes: Arc::new(AtomicUsize::new(0)),
             tcp_rx_cache_budget: Arc::new(CacheBudget::new(MAX_GLOBAL_TCP_RX_CACHE_BYTES)),
+            tcp_tx_cache_budget: Arc::new(CacheBudget::new(MAX_GLOBAL_TCP_TX_CACHE_BYTES)),
             udp_ready_tx,
             udp_ready_rx,
             pending_udp: HashMap::new(),
@@ -1843,7 +1847,7 @@ impl Redirector {
                     }
                 }
 
-                let tx_state = TcpTxState::new(
+                let mut tx_state = TcpTxState::new(
                     src,
                     dst,
                     sequence,
@@ -1855,6 +1859,7 @@ impl Redirector {
                     tx_locked.get_src_mtu(tcp.src_ip_addr())
                         - (Ipv4::minimum_len() + Tcp::minimum_len()),
                 );
+                tx_state.set_send_budget(Arc::clone(&self.tcp_tx_cache_budget));
                 tx_locked.set_state(dst, src, tx_state);
             }
 

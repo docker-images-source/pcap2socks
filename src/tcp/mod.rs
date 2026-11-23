@@ -564,6 +564,7 @@ pub struct TcpTxState {
     sacks: Option<Vec<(u32, u32)>>,
     delayed_ack: bool,
     cache: Queue,
+    send_budget: Option<Arc<CacheBudget>>,
     cache_syn: Option<Instant>,
     cache_fin: Option<Timer>,
     cache_fin_retrans: bool,
@@ -574,6 +575,14 @@ pub struct TcpTxState {
     srtt: Option<f64>,
     rttvar: Option<f64>,
     cc: Option<Box<dyn TcpCc>>,
+}
+
+impl Drop for TcpTxState {
+    fn drop(&mut self) {
+        if let Some(budget) = &self.send_budget {
+            budget.release(self.queue.len() + self.cache.len());
+        }
+    }
 }
 
 impl TcpTxState {
@@ -606,6 +615,7 @@ impl TcpTxState {
                 min(MAX_QUEUE, (RECV_WINDOW as usize) << wscale.unwrap_or(0).min(14)),
                 sequence,
             ),
+            send_budget: None,
             cache_syn: None,
             cache_fin: None,
             cache_fin_retrans: true,
@@ -725,6 +735,9 @@ impl TcpTxState {
             // Invalidate only bytes actually sent.
             let old_size = self.cache.len();
             let cache_rtt = self.cache.invalidate_to(data_ack);
+            if let Some(budget) = &self.send_budget {
+                budget.release(old_size - self.cache.len());
+            }
             progressed |= self.cache.len() < old_size;
             if rtt.is_none() {
                 rtt = cache_rtt;
@@ -856,8 +869,20 @@ impl TcpTxState {
         self.update_fin_timer();
     }
 
+    /// Installs the shared budget for outstanding queued and unacknowledged data.
+    pub fn set_send_budget(&mut self, budget: Arc<CacheBudget>) {
+        debug_assert!(self.queue.is_empty() && self.cache.is_empty());
+        self.send_budget = Some(budget);
+    }
+
     /// Appends the payload to the queue of the TCP connection.
-    pub fn append_queue(&mut self, payload: &[u8]) {
+    pub fn append_queue(&mut self, payload: &[u8]) -> io::Result<()> {
+        if payload.len() > MAX_QUEUE.saturating_sub(self.queue.len()) {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "TCP send queue is full"));
+        }
+        if let Some(budget) = &self.send_budget {
+            budget.reserve(payload.len())?;
+        }
         // TODO: major performance degradation
         self.queue.extend(payload);
         trace!(
@@ -866,6 +891,7 @@ impl TcpTxState {
             self.dst,
             self.src
         );
+        Ok(())
     }
 
     /// Appends the TCP FIN to the queue of the TCP connection.
@@ -1013,7 +1039,11 @@ impl TcpTxState {
 
     /// Returns the remaining size of the queue of the TCP connection.
     pub fn queue_remaining(&self) -> usize {
-        MAX_QUEUE.saturating_sub(self.queue().len())
+        let per_stream = MAX_QUEUE.saturating_sub(self.queue().len());
+        match &self.send_budget {
+            Some(budget) => min(per_stream, budget.remaining()),
+            None => per_stream,
+        }
     }
 
     /// Returns whether outstanding data have exceeded the ACK progress deadline.
@@ -1077,7 +1107,7 @@ mod stall_tests {
     #[test]
     fn expired_data_is_removed_by_acknowledgement() {
         let mut state = state();
-        state.append_queue(&[42]);
+        state.append_queue(&[42]).unwrap();
         state.append_cache(1).unwrap();
         state.last_ack_progress = Instant::now() - MAX_UNACKNOWLEDGED_TIME;
         assert!(state.is_stalled());
@@ -1088,7 +1118,7 @@ mod stall_tests {
         // An idle stream must not expire, even after a long time.
         state.last_ack_progress = Instant::now() - MAX_UNACKNOWLEDGED_TIME;
         assert!(!state.is_stalled());
-        state.append_queue(&[42]);
+        state.append_queue(&[42]).unwrap();
         state.append_cache(1).unwrap();
         assert!(!state.is_stalled());
     }
@@ -1096,7 +1126,7 @@ mod stall_tests {
     #[test]
     fn duplicate_acks_do_not_extend_a_stalled_connection() {
         let mut state = state();
-        state.append_queue(&[42]);
+        state.append_queue(&[42]).unwrap();
         state.append_cache(1).unwrap();
         state.last_ack_progress = Instant::now() - MAX_UNACKNOWLEDGED_TIME;
         state.acknowledge(100);
@@ -1110,7 +1140,7 @@ mod stall_tests {
         state.acknowledge(101);
         assert!(state.cache_syn().is_none());
         assert_eq!(state.cache().sequence(), 101);
-        state.append_queue(&[1, 2, 3]);
+        state.append_queue(&[1, 2, 3]).unwrap();
         state.append_cache(3).unwrap();
         state.acknowledge(104);
         assert_eq!(state.cache().len(), 0);
@@ -1119,7 +1149,7 @@ mod stall_tests {
     #[test]
     fn future_ack_does_not_discard_unsent_data() {
         let mut state = state();
-        state.append_queue(&[1, 2, 3]);
+        state.append_queue(&[1, 2, 3]).unwrap();
         state.append_cache(3).unwrap();
         state.acknowledge(104);
         assert_eq!(state.cache().len(), 3);
@@ -1128,12 +1158,33 @@ mod stall_tests {
     #[test]
     fn failed_cache_append_keeps_queued_payload() {
         let mut state = state();
-        state.append_queue(&[1, 2, 3]);
+        state.append_queue(&[1, 2, 3]).unwrap();
         // Force a full retransmission cache without consuming the send queue.
         state.cache = Queue::with_capacity(2, 100);
         assert!(state.append_cache(3).is_err());
         assert_eq!(state.queue().iter().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
         assert_eq!(state.cache().len(), 0);
+    }
+
+    #[test]
+    fn global_send_budget_tracks_ack_and_cleanup() {
+        let budget = Arc::new(CacheBudget::new(3));
+        let mut first = state();
+        first.set_send_budget(Arc::clone(&budget));
+        first.append_queue(&[1, 2, 3]).unwrap();
+        let mut second = state();
+        second.set_send_budget(Arc::clone(&budget));
+        assert_eq!(second.queue_remaining(), 0);
+        assert!(second.append_queue(&[4]).is_err());
+        first.append_cache(3).unwrap();
+        assert_eq!(second.queue_remaining(), 0);
+        first.acknowledge(103);
+        assert_eq!(second.queue_remaining(), 3);
+        second.append_queue(&[4, 5]).unwrap();
+        drop(second);
+        assert_eq!(budget.remaining(), 3);
+        drop(first);
+        assert_eq!(budget.remaining(), 3);
     }
 
     #[test]
