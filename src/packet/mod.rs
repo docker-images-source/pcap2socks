@@ -521,7 +521,7 @@ impl Fragmentation {
 /// Represents a defragmentation machine.
 #[derive(Debug, Default)]
 pub struct Defraggler {
-    frags: HashMap<(Ipv4Addr, Ipv4Addr, LayerKind, u16), Fragmentation>,
+    frags: HashMap<(Ipv4Addr, Ipv4Addr, u8, u16), Fragmentation>,
 }
 
 impl Defraggler {
@@ -544,7 +544,14 @@ impl Defraggler {
             None => return None,
         };
 
-        let key = (ipv4.src(), ipv4.dst(), ipv4.kind(), ipv4.identification());
+        // Fragment reassembly is keyed by source, destination, IP protocol and ID.
+        // `ipv4.kind()` is always `Ipv4` and would mix TCP and UDP fragments.
+        let key = (
+            ipv4.src(),
+            ipv4.dst(),
+            ipv4.next_level_protocol().0,
+            ipv4.identification(),
+        );
         self.prune_expired();
         if !self.frags.contains_key(&key) {
             if self.frags.len() >= MAX_FRAGMENT_GROUPS {
@@ -637,4 +644,48 @@ fn reject_truncated_ipv4_frame() {
     frame[16] = 0;
     frame[17] = 60; // Claims more bytes than were captured
     assert!(Indicator::from(&frame).is_none());
+}
+
+#[test]
+fn fragments_with_same_id_but_different_protocols_are_independent() {
+    // Build raw Ethernet/IPv4 fragments: transport content is opaque until the
+    // last fragment arrives. Both flows have the same addresses and IP ID.
+    fn fragment(protocol: u8, offset: u16, more: bool, data: &[u8]) -> Vec<u8> {
+        let mut frame = vec![0u8; 14 + 20 + data.len()];
+        frame[12..14].copy_from_slice(&[0x08, 0x00]); // Ethernet: IPv4
+        frame[14] = 0x45; // IPv4, 20-byte header
+        frame[16..18].copy_from_slice(&((20 + data.len()) as u16).to_be_bytes());
+        frame[18..20].copy_from_slice(&1000u16.to_be_bytes());
+        let flags_offset = (if more { 0x2000u16 } else { 0 }) | offset;
+        frame[20..22].copy_from_slice(&flags_offset.to_be_bytes());
+        frame[22] = 64; // TTL
+        frame[23] = protocol;
+        frame[26..30].copy_from_slice(&[192, 0, 2, 1]);
+        frame[30..34].copy_from_slice(&[198, 51, 100, 2]);
+        frame[34..].copy_from_slice(data);
+        frame
+    }
+
+    let mut d = Defraggler::new();
+    let udp_first = fragment(17, 0, true, &[0x11; 16]);
+    let tcp_first = fragment(6, 0, true, &[0x22; 16]);
+    let udp_indicator = Indicator::from(&udp_first).unwrap();
+    let tcp_indicator = Indicator::from(&tcp_first).unwrap();
+    assert!(d.add(&udp_indicator, &udp_first).is_none());
+    assert!(d.add(&tcp_indicator, &tcp_first).is_none());
+    assert_eq!(d.frags.len(), 2);
+
+    let udp_last = fragment(17, 2, false, &[0x33; 8]);
+    let udp_indicator = Indicator::from(&udp_last).unwrap();
+    let udp = d.add(&udp_indicator, &udp_last).unwrap();
+    assert_eq!(&udp.buffer[..16], &[0x11; 16]);
+    assert_eq!(&udp.buffer[16..24], &[0x33; 8]);
+    assert_eq!(d.frags.len(), 1);
+
+    let tcp_last = fragment(6, 2, false, &[0x44; 8]);
+    let tcp_indicator = Indicator::from(&tcp_last).unwrap();
+    let tcp = d.add(&tcp_indicator, &tcp_last).unwrap();
+    assert_eq!(&tcp.buffer[..16], &[0x22; 16]);
+    assert_eq!(&tcp.buffer[16..24], &[0x44; 8]);
+    assert!(d.frags.is_empty());
 }
