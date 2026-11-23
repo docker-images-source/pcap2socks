@@ -165,6 +165,7 @@ impl StreamWorker {
         let (rx_close_tx, mut rx_close_rx) = mpsc::channel(1);
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_cloned = Arc::clone(&cancelled);
+        let cancelled_rx = Arc::clone(&cancelled);
 
         // Send: cancellation remains selectable even while writing to a dead proxy.
         tokio::spawn(async move {
@@ -208,6 +209,9 @@ impl StreamWorker {
             let mut buffer = vec![0u8; u16::MAX as usize];
             let mut recv_zero: usize = 0;
             loop {
+                if cancelled_rx.load(Ordering::Relaxed) {
+                    break;
+                }
                 let size;
 
                 // Select
@@ -256,6 +260,11 @@ impl StreamWorker {
                     loop {
                         {
                             let mut tx_locked = tx.lock().unwrap();
+                            // The old worker must not touch a newly installed four-tuple.
+                            // Check cancellation while holding the Forwarder lock.
+                            if cancelled_rx.load(Ordering::Relaxed) {
+                                break;
+                            }
                             match tx_locked.check(dst, src) {
                                 Ok(remaining) => {
                                     // If the queue remains size
@@ -285,13 +294,19 @@ impl StreamWorker {
                             time::sleep(Duration::from_millis(QUEUE_FULL_WAIT)).await;
                         }
                     }
+                    if cancelled_rx.load(Ordering::Relaxed) {
+                        break;
+                    }
                 } else {
                     // Close
                     is_rx_closed_cloned.store(true, Ordering::Relaxed);
                     trace!("close stream RX {} -> {}", dst, 0);
 
-                    if let Err(ref e) = tx.lock().unwrap().close(dst, src) {
-                        warn!("handle close: {}: {} -> {}: {}", "TCP", dst, 0, e);
+                    let mut forwarder = tx.lock().unwrap();
+                    if !cancelled_rx.load(Ordering::Relaxed) {
+                        if let Err(ref e) = forwarder.close(dst, src) {
+                            warn!("handle close: {}: {} -> {}: {}", "TCP", dst, 0, e);
+                        }
                     }
 
                     break;
