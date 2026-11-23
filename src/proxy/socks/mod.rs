@@ -4,8 +4,16 @@ use async_socks5::{self, AddrKind, Auth};
 use log::trace;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{self, BufStream};
 use tokio::net::{TcpStream, UdpSocket};
+use tokio::time;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn connect_timeout() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "SOCKS5 connection timed out")
+}
 
 /// Represents the username and the password of the authentication connecting to a SOCKS5 server.
 #[derive(Clone, Debug)]
@@ -58,9 +66,12 @@ pub async fn connect(
     dst: SocketAddrV4,
     options: &SocksOption,
 ) -> io::Result<BufStream<TcpStream>> {
-    let stream = TcpStream::connect(remote).await?;
+    let stream = time::timeout(CONNECT_TIMEOUT, TcpStream::connect(remote))
+        .await.map_err(|_| connect_timeout())??;
     let mut stream = BufStream::new(stream);
-    if let Err(e) = async_socks5::connect(&mut stream, dst, options.auth()).await {
+    let result = time::timeout(CONNECT_TIMEOUT, async_socks5::connect(&mut stream, dst, options.auth()))
+        .await.map_err(|_| connect_timeout())?;
+    if let Err(e) = result {
         return match e {
             async_socks5::Error::Io(e) => Err(e),
             _ => Err(io::Error::new(io::ErrorKind::Other, e)),
@@ -209,20 +220,19 @@ pub async fn bind(
     options: &SocksOption,
 ) -> io::Result<(SocksRecvHalf, SocksSendHalf, u16)> {
     // Connect
-    let stream = TcpStream::connect(remote).await?;
+    let stream = time::timeout(CONNECT_TIMEOUT, TcpStream::connect(remote))
+        .await.map_err(|_| connect_timeout())??;
     let stream = BufStream::new(stream);
 
     let local = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
     let socket = UdpSocket::bind(local).await?;
-    let local_port = socket.local_addr().unwrap().port();
-    let datagram = match async_socks5::SocksDatagram::associate::<SocketAddrV4>(
-        stream,
-        socket,
-        options.auth(),
-        None,
-    )
-    .await
-    {
+    let local_port = socket.local_addr()?.port();
+    let datagram = match time::timeout(
+        CONNECT_TIMEOUT,
+        async_socks5::SocksDatagram::associate::<SocketAddrV4>(
+            stream, socket, options.auth(), None,
+        ),
+    ).await.map_err(|_| connect_timeout())? {
         Ok(datagram) => datagram,
         Err(e) => return match e {
             async_socks5::Error::Io(e) => Err(e),

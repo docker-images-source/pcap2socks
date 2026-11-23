@@ -2,7 +2,7 @@
 
 use log::{debug, trace, warn};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -71,11 +71,16 @@ const MAX_RECV_ZERO: usize = 3;
 
 /// Represents the interval of a tick.
 const TICK_INTERVAL: u64 = 500;
+/// Bound bytes queued for a SOCKS5 TCP writer; overflow closes the TCP connection.
+const MAX_TCP_PENDING_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum queued UDP datagrams per association.
+const MAX_UDP_PENDING_DATAGRAMS: usize = 256;
 
 /// Represents a worker of a proxied TCP stream.
 pub struct StreamWorker {
     dst: SocketAddrV4,
     tx_tx: UnboundedSender<Vec<u8>>,
+    queued_bytes: Arc<AtomicUsize>,
     is_tx_closed: Arc<AtomicBool>,
     is_rx_closed: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
@@ -117,6 +122,8 @@ impl StreamWorker {
 
         let (tx_tx, mut tx_rx): (UnboundedSender<Vec<u8>>, UnboundedReceiver<Vec<u8>>) =
             mpsc::unbounded_channel();
+        let queued_bytes = Arc::new(AtomicUsize::new(0));
+        let queued_bytes_tx = Arc::clone(&queued_bytes);
         let is_tx_closed = Arc::new(AtomicBool::new(false));
         let is_tx_closed_cloned = Arc::clone(&is_tx_closed);
         let is_rx_closed = Arc::new(AtomicBool::new(false));
@@ -141,6 +148,7 @@ impl StreamWorker {
                     tokio::select! {
                         r = tx_rx_fut => match r {
                             Some(payload) => {
+                                queued_bytes_tx.fetch_sub(payload.len(), Ordering::Relaxed);
                                 match stream_tx.write_all(payload.as_slice()).await {
                                     Ok(_) => {
                                         debug!(
@@ -301,6 +309,7 @@ impl StreamWorker {
         Ok(StreamWorker {
             dst,
             tx_tx,
+            queued_bytes,
             is_tx_closed,
             is_rx_closed,
             cancelled,
@@ -311,11 +320,14 @@ impl StreamWorker {
 
     /// Sends data on the proxied stream in TCP to the destination.
     pub fn send(&mut self, payload: Vec<u8>) -> io::Result<()> {
-        // Send
+        let size = payload.len();
+        self.queued_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(size).filter(|&next| next <= MAX_TCP_PENDING_BYTES)
+        }).map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "TCP proxy queue limit exceeded"))?;
         if self.tx_tx.send(payload).is_err() {
+            self.queued_bytes.fetch_sub(size, Ordering::Relaxed);
             return Err(io::Error::from(io::ErrorKind::NotConnected));
         }
-
         Ok(())
     }
 
@@ -562,7 +574,7 @@ pub trait ForwardDatagram: Send {
 pub struct DatagramWorker {
     src: Arc<AtomicU64>,
     local_port: u16,
-    tx_tx: UnboundedSender<(Vec<u8>, SocketAddrV4)>,
+    tx_tx: Sender<(Vec<u8>, SocketAddrV4)>,
     is_closed: Arc<AtomicBool>,
     close_tx: Sender<()>,
     close_tx2: Sender<()>,
@@ -581,9 +593,9 @@ impl DatagramWorker {
 
         #[allow(clippy::type_complexity)]
         let (tx_tx, mut tx_rx): (
-            UnboundedSender<(Vec<u8>, SocketAddrV4)>,
-            UnboundedReceiver<(Vec<u8>, SocketAddrV4)>,
-        ) = mpsc::unbounded_channel();
+            Sender<(Vec<u8>, SocketAddrV4)>,
+            mpsc::Receiver<(Vec<u8>, SocketAddrV4)>,
+        ) = mpsc::channel(MAX_UDP_PENDING_DATAGRAMS);
         let a_src = Arc::new(AtomicU64::from(socket_addr_v4_to_u64(&src)));
         let a_src_cloned = Arc::clone(&a_src);
         let is_closed = Arc::new(AtomicBool::new(false));
@@ -737,12 +749,13 @@ impl DatagramWorker {
         if self.is_closed() {
             return Err(io::Error::from(io::ErrorKind::NotConnected));
         }
-        // Send
-        if self.tx_tx.send((payload, dst)).is_err() {
-            return Err(io::Error::from(io::ErrorKind::NotConnected));
-        }
-
-        Ok(())
+        self.tx_tx.try_send((payload, dst)).map_err(|err| {
+            let kind = match err {
+                mpsc::error::TrySendError::Full(_) => io::ErrorKind::WouldBlock,
+                mpsc::error::TrySendError::Closed(_) => io::ErrorKind::NotConnected,
+            };
+            io::Error::from(kind)
+        })
     }
 
     /// Sets the source of the worker.
