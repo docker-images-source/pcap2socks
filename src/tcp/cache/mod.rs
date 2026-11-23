@@ -592,18 +592,19 @@ impl Window {
                 }
             }
 
-            // Merge previous range
-            let mut size = end - sequence;
+            // Merge previous range without losing its existing right edge.
+            // Remove the old entry so there is exactly one merged range.
             if let Some(prev_key) = prev_key {
-                let prev_size = *self.edges.get(&prev_key).unwrap();
-                if prev_key + (prev_size as u64) >= sequence {
-                    size += sequence - prev_key;
+                let prev_end = prev_key + *self.edges.get(&prev_key).unwrap() as u64;
+                if prev_end >= sequence {
+                    end = max(end, prev_end);
                     sequence = prev_key;
+                    self.edges.remove(&prev_key);
                 }
             }
 
             // Insert range
-            self.edges.insert(sequence, size as usize);
+            self.edges.insert(sequence, (end - sequence) as usize);
         }
 
         // Pop if possible
@@ -770,6 +771,24 @@ fn queue_and_window_wrap_across_zero() {
     let mut window = Window::with_capacity(32, u32::MAX - 1);
     assert_eq!(window.append(u32::MAX - 1, &[1, 2, 3]).unwrap(), Some(vec![1, 2, 3]));
     assert_eq!(window.sequence(), 1);
+}
+
+#[test]
+fn overlapping_fragment_does_not_shrink_cached_range() {
+    let mut w = Window::with_capacity(64, 0);
+    assert!(w.append(10, &(10..20).collect::<Vec<_>>()).unwrap().is_none());
+    assert!(w.append(15, &(15..18).collect::<Vec<_>>()).unwrap().is_none());
+    let completed = w.append(0, &(0..10).collect::<Vec<_>>()).unwrap();
+    assert_eq!(completed, Some((0..20).collect::<Vec<_>>()));
+}
+
+#[test]
+fn overlapping_fragment_extends_cached_range() {
+    let mut w = Window::with_capacity(64, 0);
+    assert!(w.append(10, &(10..20).collect::<Vec<_>>()).unwrap().is_none());
+    assert!(w.append(15, &(15..25).collect::<Vec<_>>()).unwrap().is_none());
+    let completed = w.append(0, &(0..10).collect::<Vec<_>>()).unwrap();
+    assert_eq!(completed, Some((0..25).collect::<Vec<_>>()));
 }
 
 #[test]
