@@ -44,6 +44,10 @@ async fn main() {
             inter.mtu()
         }
     };
+    if !(68..=u16::MAX as usize).contains(&mtu) {
+        error!("Invalid MTU {}: expected 68..65535", mtu);
+        return;
+    }
     info!("Use MTU {}", mtu);
 
     // Route

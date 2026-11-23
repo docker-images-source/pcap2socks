@@ -86,7 +86,46 @@ impl Indicator {
 
     /// Creates a `Indicator` by the given frame.
     pub fn from(frame: &[u8]) -> Option<Indicator> {
-        EthernetPacket::new(frame).map(|packet| Indicator::parse(&packet))
+        let packet = EthernetPacket::new(frame)?;
+        if packet.get_ethertype() == EtherTypes::Ipv4 {
+            let data = packet.payload();
+            let ipv4 = Ipv4Packet::new(data)?;
+            let header_len = ipv4.get_header_length() as usize * 4;
+            let total_len = ipv4.get_total_length() as usize;
+            if ipv4.get_version() != 4
+                || header_len < Ipv4::minimum_len()
+                || total_len < header_len
+                || total_len > data.len()
+                || header_len > data.len()
+            {
+                return None;
+            }
+            if ipv4.get_fragment_offset() == 0 && ipv4.get_flags() & 1 == 0 {
+                let payload = &data[header_len..total_len];
+                match ipv4.get_next_level_protocol() {
+                    IpNextHeaderProtocols::Tcp => {
+                        let tcp = TcpPacket::new(payload)?;
+                        if payload.len() < 20
+                            || tcp.get_data_offset() < 5
+                            || tcp.get_data_offset() as usize * 4 > payload.len()
+                        {
+                            return None;
+                        }
+                    }
+                    IpNextHeaderProtocols::Udp => {
+                        let udp = UdpPacket::new(payload)?;
+                        if payload.len() < 8
+                            || udp.get_length() < 8
+                            || udp.get_length() as usize > payload.len()
+                        {
+                            return None;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some(Indicator::parse(&packet))
     }
 
     /// Returns the brief of the indicator.
@@ -356,6 +395,8 @@ impl Display for Indicator {
 
 /// Represents the expire time of each group of fragments.
 const EXPIRE_TIME: u128 = 10000;
+/// Limit incomplete IPv4 fragment groups to about 8 MiB of payload buffers.
+const MAX_FRAGMENT_GROUPS: usize = 128;
 
 /// Represents a fragmentation.
 #[allow(dead_code)]
@@ -366,6 +407,7 @@ pub struct Fragmentation {
     buffer: Vec<u8>,
     length: usize,
     total_length: Option<usize>,
+    ranges: Vec<(usize, usize)>,
     last_seen: Instant,
 }
 
@@ -387,42 +429,67 @@ impl Fragmentation {
             buffer: vec![0; u16::MAX as usize],
             length: 0,
             total_length: None,
+            ranges: Vec::new(),
             last_seen: Instant::now(),
         };
 
         Some(frag)
     }
 
-    /// Adds a fragmentation.
-    pub fn add(&mut self, indicator: &Indicator, payload: &[u8]) {
-        // Payload
+    /// Adds a non-overlapping fragment. Invalid or overlapping groups are discarded.
+    pub fn add(&mut self, indicator: &Indicator, payload: &[u8]) -> bool {
         let ipv4 = match indicator.ipv4() {
             Some(ipv4) => ipv4,
-            None => return,
+            None => return false,
         };
         let offset = (ipv4.fragment_offset() as usize) * 8;
+        let end = match offset.checked_add(payload.len()) {
+            Some(end) if !payload.is_empty() && end <= self.buffer.len() => end,
+            _ => return false,
+        };
+        if (ipv4.is_more_fragment() && payload.len() % 8 != 0)
+            || self.ranges.iter().any(|&(begin, finish)| offset < finish && begin < end)
+            || self.total_length.is_some_and(|total| end > total)
+        {
+            return false;
+        }
         if !ipv4.is_more_fragment() {
-            self.total_length = Some(offset + payload.len());
+            if self.total_length.is_some_and(|total| total != end)
+                || self.ranges.iter().any(|&(_, finish)| finish > end)
+            {
+                return false;
+            }
+            self.total_length = Some(end);
         }
 
-        self.buffer[offset..offset + payload.len()].copy_from_slice(payload);
+        self.buffer[offset..end].copy_from_slice(payload);
+        self.ranges.push((offset, end));
         self.length += payload.len();
+        self.last_seen = Instant::now();
+        true
     }
 
     /// Concatenates fragmentations and returns the transport layer and the payload.
     pub fn concatenate(&self) -> (Option<Layers>, &[u8]) {
+        let data = &self.buffer[..self.length];
         let transport = match self.ipv4.next_level_protocol() {
-            IpNextHeaderProtocols::Icmp => {
-                IcmpPacket::new(&self.buffer[..self.length])
-                    .map(|icmp_packet| Layers::Icmpv4(Icmpv4::parse(&icmp_packet)))
+            IpNextHeaderProtocols::Icmp => IcmpPacket::new(data)
+                .map(|packet| Layers::Icmpv4(Icmpv4::parse(&packet))),
+            IpNextHeaderProtocols::Tcp => match TcpPacket::new(data) {
+                Some(packet) if packet.get_data_offset() >= 5
+                    && packet.get_data_offset() as usize * 4 <= data.len() =>
+                {
+                    Some(Layers::Tcp(Tcp::parse(&packet, &self.ipv4)))
+                }
+                _ => None,
             },
-            IpNextHeaderProtocols::Tcp => {
-                TcpPacket::new(&self.buffer[..self.length])
-                    .map(|tcp_packet| Layers::Tcp(Tcp::parse(&tcp_packet, &self.ipv4)))
-            },
-            IpNextHeaderProtocols::Udp => {
-                UdpPacket::new(&self.buffer[..self.length])
-                    .map(|udp_packet| Layers::Udp(Udp::parse(&udp_packet, &self.ipv4)))
+            IpNextHeaderProtocols::Udp => match UdpPacket::new(data) {
+                Some(packet) if packet.get_length() >= 8
+                    && packet.get_length() as usize <= data.len() =>
+                {
+                    Some(Layers::Udp(Udp::parse(&packet, &self.ipv4)))
+                }
+                _ => None,
             },
             _ => None,
         };
@@ -431,6 +498,9 @@ impl Fragmentation {
             Some(transport) => transport.len(),
             None => 0,
         };
+        if header_size > self.length {
+            return (None, &[]);
+        }
         (transport, &self.buffer[header_size..self.length])
     }
 
@@ -462,6 +532,11 @@ impl Defraggler {
         }
     }
 
+    /// Releases expired fragment groups, including when the network is idle.
+    pub fn prune_expired(&mut self) {
+        self.frags.retain(|_, frag| !frag.is_expired());
+    }
+
     /// Adds a fragmentation and returns the fragmentation if it is completed.
     pub fn add(&mut self, indicator: &Indicator, frame: &[u8]) -> Option<Fragmentation> {
         let ipv4 = match indicator.ipv4() {
@@ -470,24 +545,26 @@ impl Defraggler {
         };
 
         let key = (ipv4.src(), ipv4.dst(), ipv4.kind(), ipv4.identification());
-
-        let is_create = match self.frags.get(&key) {
-            Some(frag) => frag.is_expired(),
-            None => true,
-        };
-        if is_create {
-            let frag = match Fragmentation::new(indicator) {
-                Some(frag) => frag,
-                None => return None,
-            };
-
-            self.frags.insert(key, frag);
+        self.prune_expired();
+        if !self.frags.contains_key(&key) {
+            if self.frags.len() >= MAX_FRAGMENT_GROUPS {
+                if let Some(oldest) = self.frags.iter()
+                    .min_by_key(|(_, frag)| frag.last_seen)
+                    .map(|(key, _)| *key)
+                {
+                    self.frags.remove(&oldest);
+                }
+            }
+            self.frags.insert(key, Fragmentation::new(indicator)?);
         }
 
-        // Add fragmentation
-        let frag = self.frags.get_mut(&key).unwrap();
-        let header_size = indicator.ethernet().unwrap().len() + ipv4.len();
-        frag.add(indicator, &frame[header_size..]);
+        let header_size = indicator.ethernet()?.len() + ipv4.len();
+        let payload = frame.get(header_size..)?;
+        let frag = self.frags.get_mut(&key)?;
+        if !frag.add(indicator, payload) {
+            self.frags.remove(&key);
+            return None;
+        }
         if frag.is_completed() {
             self.frags.remove(&key)
         } else {
@@ -549,4 +626,15 @@ fn defraggler_add() {
     let (_, p) = f.concatenate();
 
     assert_eq!(p, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+}
+
+#[test]
+fn reject_truncated_ipv4_frame() {
+    let mut frame = [0u8; 34];
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    frame[14] = 0x45; // IPv4 with a 20-byte header
+    frame[16] = 0;
+    frame[17] = 60; // Claims more bytes than were captured
+    assert!(Indicator::from(&frame).is_none());
 }

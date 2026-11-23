@@ -138,6 +138,9 @@ impl Forwarder {
 
     /// Sets the source MTU.
     pub fn set_src_mtu(&mut self, src_ip_addr: Ipv4Addr, mtu: usize) -> bool {
+        if !(68..=u16::MAX as usize).contains(&mtu) {
+            return false;
+        }
         let prev_mtu = *self
             .src_mtu_map
             .get(&src_ip_addr)
@@ -851,11 +854,13 @@ impl Forwarder {
                 Some(payload) => payload.len(),
                 None => 0,
             };
-        let mss = *self
+        let mtu = *self
             .src_mtu_map
             .get(&src_ip_addr)
-            .unwrap_or(&self.local_mtu)
-            - Ipv4::minimum_len();
+            .unwrap_or(&self.local_mtu);
+        let mss = mtu.checked_sub(Ipv4::minimum_len())
+            .filter(|&mss| mss >= 8)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid IPv4 MTU"))?;
         if size <= mss {
             // IPv4
             let ipv4 = Ipv4::new(
@@ -912,6 +917,9 @@ impl Forwarder {
             while n < size {
                 let mut length = min(size - n, mss);
                 let mut remain = size - n - length;
+                if remain > 0 && length < 16 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "MTU too small for fragmentation"));
+                }
 
                 // Alignment
                 if remain > 0 {
@@ -922,6 +930,9 @@ impl Forwarder {
                 // Leave at least 8 Bytes for last fragment
                 if remain > 0 && remain < 8 {
                     length -= 8;
+                }
+                if length == 0 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "zero-length IPv4 fragment"));
                 }
 
                 // IPv4
@@ -1272,6 +1283,7 @@ impl Redirector {
         loop {
             if last_udp_cleanup.elapsed() >= UDP_CLEANUP_INTERVAL {
                 self.prune_closed_udp_ports();
+                self.defrag.prune_expired();
                 last_udp_cleanup = Instant::now();
             }
             // Drop stale streams on the receiving task, which owns both state maps.

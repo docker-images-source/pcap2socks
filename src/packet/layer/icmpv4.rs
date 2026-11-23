@@ -102,8 +102,8 @@ impl Icmpv4 {
     /// Returns the identifier (NE) of the layer.
     pub fn identifier(&self) -> Option<u16> {
         if self.is_echo_reply() || self.is_echo_request() {
-            let buffer = [self.layer.payload[0], self.layer.payload[1]];
-            Some(u16::from_ne_bytes(buffer))
+            let bytes = self.layer.payload.get(..2)?;
+            Some(u16::from_ne_bytes([bytes[0], bytes[1]]))
         } else {
             None
         }
@@ -112,8 +112,8 @@ impl Icmpv4 {
     /// Returns the sequence number (NE) of the layer.
     pub fn sequence_number(&self) -> Option<u16> {
         if self.is_echo_reply() || self.is_echo_request() {
-            let buffer = [self.layer.payload[2], self.layer.payload[3]];
-            Some(u16::from_ne_bytes(buffer))
+            let bytes = self.layer.payload.get(2..4)?;
+            Some(u16::from_ne_bytes([bytes[0], bytes[1]]))
         } else {
             None
         }
@@ -122,8 +122,8 @@ impl Icmpv4 {
     /// Returns the next-hop MTU of the layer.
     pub fn next_hop_mtu(&self) -> Option<u16> {
         if self.is_fragmentation_required_and_df_flag_set() {
-            let buffer = [self.layer.payload[2], self.layer.payload[3]];
-            Some(u16::from_be_bytes(buffer))
+            let bytes = self.layer.payload.get(2..4)?;
+            Some(u16::from_be_bytes([bytes[0], bytes[1]]))
         } else {
             None
         }
@@ -134,7 +134,7 @@ impl Icmpv4 {
         if self.is_destination_port_unreachable()
             || self.is_fragmentation_required_and_df_flag_set()
         {
-            let (ipv4, _) = self.parse_payload().unwrap();
+            let (ipv4, _) = self.parse_payload()?;
             Some(ipv4.src())
         } else {
             None
@@ -146,7 +146,7 @@ impl Icmpv4 {
         if self.is_destination_port_unreachable()
             || self.is_fragmentation_required_and_df_flag_set()
         {
-            let (ipv4, _) = self.parse_payload().unwrap();
+            let (ipv4, _) = self.parse_payload()?;
             Some(ipv4.dst())
         } else {
             None
@@ -158,7 +158,7 @@ impl Icmpv4 {
         if self.is_destination_port_unreachable()
             || self.is_fragmentation_required_and_df_flag_set()
         {
-            let (ipv4, _) = self.parse_payload().unwrap();
+            let (ipv4, _) = self.parse_payload()?;
             Some(ipv4.next_level_protocol())
         } else {
             None
@@ -170,7 +170,7 @@ impl Icmpv4 {
         if self.is_destination_port_unreachable()
             || self.is_fragmentation_required_and_df_flag_set()
         {
-            let (ipv4, _) = self.parse_payload().unwrap();
+            let (ipv4, _) = self.parse_payload()?;
             ipv4.next_level_layer_kind()
         } else {
             None
@@ -182,7 +182,7 @@ impl Icmpv4 {
         if self.is_destination_port_unreachable()
             || self.is_fragmentation_required_and_df_flag_set()
         {
-            let (_, transport) = self.parse_payload().unwrap();
+            let (_, transport) = self.parse_payload()?;
             match transport {
                 Some(transport) => match transport {
                     Layers::Tcp(ref tcp) => Some(SocketAddrV4::new(tcp.src_ip_addr(), tcp.src())),
@@ -201,7 +201,7 @@ impl Icmpv4 {
         if self.is_destination_port_unreachable()
             || self.is_fragmentation_required_and_df_flag_set()
         {
-            let (_, transport) = self.parse_payload().unwrap();
+            let (_, transport) = self.parse_payload()?;
             match transport {
                 Some(transport) => match transport {
                     Layers::Tcp(ref tcp) => Some(SocketAddrV4::new(tcp.dst_ip_addr(), tcp.dst())),
