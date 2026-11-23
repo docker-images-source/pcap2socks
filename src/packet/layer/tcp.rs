@@ -199,7 +199,7 @@ impl Tcp {
         ts: Option<(u32, u32)>,
     ) -> Tcp {
         let mut tcp = Tcp::new_ack(src, dst, sequence, acknowledgement, window, None, ts);
-        tcp.layer.flags = TcpFlags::FIN;
+        tcp.layer.flags |= TcpFlags::FIN;
         tcp
     }
 
@@ -585,4 +585,18 @@ fn get_number_from_option(option: &TcpOption) -> TcpOptionNumber {
         return *tr;
     }
     */
+}
+
+#[cfg(test)]
+mod fin_flag_tests {
+    use super::Tcp;
+
+    #[test]
+    fn standalone_fin_keeps_ack_and_fin_flags() {
+        let packet = Tcp::new_fin(12345, 443, 100, 200, 4096, None);
+        assert!(packet.is_ack());
+        assert!(packet.is_fin());
+        assert!(packet.is_ack_fin());
+        assert!(!packet.is_rst());
+    }
 }
