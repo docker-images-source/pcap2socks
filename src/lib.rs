@@ -179,7 +179,7 @@ impl Forwarder {
             .ipv4_identification_map
             .entry((src_ip_addr, dst_ip_addr))
             .or_insert(0);
-        *entry = entry.checked_add(1).unwrap_or(0);
+        *entry = entry.wrapping_add(1);
         trace!(
             "increase IPv4 identification of {} -> {} to {}",
             dst_ip_addr,
@@ -375,10 +375,7 @@ impl Forwarder {
 
         // Retransmit
         for range in &ranges {
-            let size = range
-                .1
-                .checked_sub(range.0)
-                .unwrap_or_else(|| range.1 + (u32::MAX - range.0)) as usize;
+            let size = range.1.wrapping_sub(range.0) as usize;
             let state = self
                 .get_state(dst, src)
                 .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
@@ -598,12 +595,8 @@ impl Forwarder {
                 .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
             let size = min(mss, payload.len() - i * mss);
             let payload = &payload[i * mss..i * mss + size];
-            let sequence = sequence
-                .checked_add((i * mss) as u32)
-                .unwrap_or_else(|| (i * mss) as u32 - (u32::MAX - sequence));
-            let mut recv_next = sequence
-                .checked_add(size as u32)
-                .unwrap_or_else(|| size as u32 - (u32::MAX - sequence));
+            let sequence = sequence.wrapping_add((i * mss) as u32);
+            let mut recv_next = sequence.wrapping_add(size as u32);
 
             // TCP
             let tcp;
@@ -647,9 +640,7 @@ impl Forwarder {
 
             // Update TCP sequence
             let record_sequence = state.sequence();
-            let sub_sequence = recv_next
-                .checked_sub(record_sequence)
-                .unwrap_or_else(|| recv_next + (u32::MAX - record_sequence));
+            let sub_sequence = recv_next.wrapping_sub(record_sequence);
             if (sub_sequence as usize) <= MAX_U32_WINDOW_SIZE {
                 state.add_sequence(sub_sequence);
             }
@@ -1128,18 +1119,9 @@ impl ForwardDatagram for Forwarder {
 
 #[allow(clippy::unnecessary_lazy_evaluations)]
 fn disjoint_u32_range(main: (u32, u32), sub: (u32, u32)) -> Vec<(u32, u32)> {
-    let size_main = main
-        .1
-        .checked_sub(main.0)
-        .unwrap_or_else(|| main.1 + (u32::MAX - main.0)) as usize;
-    let diff_first = sub
-        .0
-        .checked_sub(main.0)
-        .unwrap_or_else(|| sub.0 + (u32::MAX - main.0)) as usize;
-    let diff_second = sub
-        .1
-        .checked_sub(main.1)
-        .unwrap_or_else(|| sub.1 + (u32::MAX - main.1)) as usize;
+    let size_main = main.1.wrapping_sub(main.0) as usize;
+    let diff_first = sub.0.wrapping_sub(main.0) as usize;
+    let diff_second = sub.1.wrapping_sub(main.1) as usize;
     let mut vector = Vec::with_capacity(2);
 
     #[allow(clippy::collapsible_if)]
@@ -1162,10 +1144,7 @@ fn disjoint_u32_range(main: (u32, u32), sub: (u32, u32)) -> Vec<(u32, u32)> {
         #[allow(clippy::collapsible_if)]
         if diff_second > MAX_U32_WINDOW_SIZE {
             // The distance between the main's left edge and the sub's right edge
-            let diff = sub
-                .1
-                .checked_sub(main.0)
-                .unwrap_or_else(|| sub.1 + (u32::MAX - main.0)) as usize;
+            let diff = sub.1.wrapping_sub(main.0) as usize;
             if diff > MAX_U32_WINDOW_SIZE {
                 // sub is in the left of the main
                 vector.push((main.0, main.1));
@@ -1696,7 +1675,7 @@ impl Redirector {
 
                 let mut rng = rand::thread_rng();
                 let sequence = rng.r#gen::<u32>();
-                let acknowledgement = tcp.sequence().checked_add(1).unwrap_or(0);
+                let acknowledgement = tcp.sequence().wrapping_add(1);
                 if let Some(mss) = tcp.mss() {
                     let mtu = Ipv4::minimum_len() + Tcp::minimum_len() + mss as usize;
                     if tx_locked.set_src_mtu(tcp.src_ip_addr(), mtu) {
@@ -1806,9 +1785,7 @@ impl Redirector {
                 if tcp.is_fin() {
                     // Update FIN sequence
                     state.set_fin_sequence(
-                        tcp.sequence()
-                            .checked_add(payload.len() as u32)
-                            .unwrap_or_else(|| payload.len() as u32 - (u32::MAX - tcp.sequence())),
+                        tcp.sequence().wrapping_add(payload.len() as u32),
                     );
                 }
 

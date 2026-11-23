@@ -641,10 +641,7 @@ impl TcpTxState {
     /// Adds sequence to the TCP connection.
     #[allow(clippy::unnecessary_lazy_evaluations)]
     pub fn add_sequence(&mut self, n: u32) {
-        self.sequence = self
-            .sequence
-            .checked_add(n)
-            .unwrap_or_else(|| n - (u32::MAX - self.sequence));
+        self.sequence = self.sequence.wrapping_add(n);
         trace!(
             "add TCP sequence of {} -> {} to {}",
             self.dst,
@@ -656,10 +653,7 @@ impl TcpTxState {
     /// Adds acknowledgement to the TCP connection.
     #[allow(clippy::unnecessary_lazy_evaluations)]
     pub fn add_acknowledgement(&mut self, n: u32) {
-        self.acknowledgement = self
-            .acknowledgement
-            .checked_add(n)
-            .unwrap_or_else(|| n - (u32::MAX - self.acknowledgement));
+        self.acknowledgement = self.acknowledgement.wrapping_add(n);
         trace!(
             "add TCP acknowledgement of {} -> {} to {}",
             self.dst,
@@ -710,8 +704,8 @@ impl TcpTxState {
 
                 self.cache_syn = None;
                 progressed = true;
-                // SYN consumes one byte in the sequence space of the data cache.
-                self.cache.invalidate_to(sequence);
+                // SYN consumes one sequence number but does not enqueue payload.
+                self.cache.advance_empty(sequence);
                 trace!("acknowledge TCP SYN of {} -> {}", self.dst, self.src);
 
                 // Update TCP sequence
@@ -1127,6 +1121,17 @@ mod stall_tests {
     }
 
     #[test]
+    fn tcp_sequence_counters_wrap_at_32_bits() {
+        let mut state = state();
+        state.sequence = u32::MAX;
+        state.acknowledgement = u32::MAX;
+        state.add_sequence(1);
+        state.add_acknowledgement(1);
+        assert_eq!(state.sequence, 0);
+        assert_eq!(state.acknowledgement, 0);
+    }
+
+    #[test]
     fn unacknowledged_fin_expires() {
         let mut state = state();
         state.append_cache_fin();
@@ -1197,10 +1202,7 @@ impl TcpRxState {
     /// Adds receive next to the TCP connection.
     #[allow(clippy::unnecessary_lazy_evaluations)]
     pub fn add_recv_next(&mut self, n: u32) {
-        self.recv_next = self
-            .recv_next
-            .checked_add(n)
-            .unwrap_or_else(|| n - (u32::MAX - self.recv_next));
+        self.recv_next = self.recv_next.wrapping_add(n);
         trace!(
             "add TCP receive next of {} -> {} to {}",
             self.src,
