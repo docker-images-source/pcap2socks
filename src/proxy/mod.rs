@@ -610,7 +610,7 @@ pub trait ForwardDatagram: Send {
 pub struct DatagramWorker {
     src: Arc<AtomicU64>,
     local_port: u16,
-    last_used: Instant,
+    last_used: Arc<Mutex<Instant>>,
     tx_tx: Sender<(Vec<u8>, SocketAddrV4)>,
     is_closed: Arc<AtomicBool>,
     close_tx: Sender<()>,
@@ -635,6 +635,8 @@ impl DatagramWorker {
         ) = mpsc::channel(MAX_UDP_PENDING_DATAGRAMS);
         let a_src = Arc::new(AtomicU64::from(socket_addr_v4_to_u64(&src)));
         let a_src_cloned = Arc::clone(&a_src);
+        let last_used = Arc::new(Mutex::new(Instant::now()));
+        let last_used_rx = Arc::clone(&last_used);
         let is_closed = Arc::new(AtomicBool::new(false));
         let is_closed_cloned = Arc::clone(&is_closed);
         let is_closed_tx = Arc::clone(&is_closed);
@@ -741,6 +743,7 @@ impl DatagramWorker {
                 }
 
                 if !closed && size > 0 {
+                    *last_used_rx.lock().unwrap() = Instant::now();
                     // Send
                     if let Err(ref e) = tx.lock().unwrap().forward(
                         addr,
@@ -772,7 +775,7 @@ impl DatagramWorker {
             DatagramWorker {
                 src: a_src,
                 local_port,
-                last_used: Instant::now(),
+                last_used,
                 tx_tx,
                 is_closed,
                 close_tx,
@@ -794,13 +797,13 @@ impl DatagramWorker {
             };
             io::Error::from(kind)
         })?;
-        self.last_used = Instant::now();
+        *self.last_used.lock().unwrap() = Instant::now();
         Ok(())
     }
 
     /// Returns whether the association has been unused beyond the limit.
     pub fn is_idle(&self, timeout: Duration) -> bool {
-        self.last_used.elapsed() >= timeout
+        self.last_used.lock().unwrap().elapsed() >= timeout
     }
 
     /// Sets the source of the worker.

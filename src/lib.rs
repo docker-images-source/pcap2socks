@@ -1182,6 +1182,8 @@ const MAX_RECV_WSCALE: u8 = 8;
 const MAX_UDP_PORT: usize = 256;
 /// Retire idle UDP mappings instead of stealing a still-active association.
 const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+/// At capacity, reclaim only long-inactive associations, never recent ones.
+const UDP_PRESSURE_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// Represents the interval for reclaiming closed UDP associations.
 const UDP_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 /// Drop TCP sessions that have received no client traffic for two hours.
@@ -2015,9 +2017,15 @@ impl Redirector {
             }
             return Ok(());
         }
-        if self.pending_udp.len() >= MAX_PENDING_UDP_ASSOCIATIONS
-            || self.udp_lru.len() >= self.udp_lru.cap() {
+        if self.pending_udp.len() >= MAX_PENDING_UDP_ASSOCIATIONS {
             return Ok(());
+        }
+        if self.udp_lru.len() >= self.udp_lru.cap() {
+            self.prune_udp_ports(UDP_PRESSURE_IDLE_TIMEOUT);
+            // Do not evict a recently active game session to accept a new port.
+            if self.udp_lru.len() >= self.udp_lru.cap() {
+                return Ok(());
+            }
         }
         self.next_udp_id = self.next_udp_id.wrapping_add(1);
         let id = self.next_udp_id;
@@ -2040,11 +2048,15 @@ impl Redirector {
     }
 
     fn prune_closed_udp_ports(&mut self) {
+        self.prune_udp_ports(UDP_IDLE_TIMEOUT);
+    }
+
+    fn prune_udp_ports(&mut self, idle_timeout: Duration) {
         let closed: Vec<u16> = self
             .datagrams
             .iter()
             .filter_map(|(&port, worker)|
-                (worker.is_closed() || worker.is_idle(UDP_IDLE_TIMEOUT)).then_some(port))
+                (worker.is_closed() || worker.is_idle(idle_timeout)).then_some(port))
             .collect();
         for port in closed {
             if let Some(src) = self.udp_lru.pop(&port) {
