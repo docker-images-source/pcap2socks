@@ -5,6 +5,7 @@ use std::clone::Clone;
 use std::fmt::{self, Display, Formatter};
 use std::io;
 use std::net::Ipv4Addr;
+use std::time::Duration;
 
 #[cfg(windows)]
 use netifs;
@@ -68,6 +69,8 @@ impl Interface {
         let config = Config {
             write_buffer_size: BUFFER_SIZE,
             read_buffer_size: BUFFER_SIZE,
+            // Wake the redirector to reap stale TCP streams on an idle LAN.
+            read_timeout: Some(Duration::from_millis(500)),
             ..Config::default()
         };
         let channel = datalink::channel(&inter, config)?;

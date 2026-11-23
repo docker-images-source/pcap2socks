@@ -540,6 +540,8 @@ const INITIAL_RTO: u64 = 1000;
 const MIN_RTO: u64 = 1000;
 /// Represents the maximum timeout for a retransmission in a TCP connection.
 const MAX_RTO: u64 = 60000;
+/// Maximum time with outstanding TCP data and no acknowledgement progress.
+const MAX_UNACKNOWLEDGED_TIME: Duration = Duration::from_secs(300);
 
 const RTO_K: f64 = 4.0;
 const RTO_ALPHA: f64 = 1.0 / 8.0;
@@ -566,6 +568,7 @@ pub struct TcpTxState {
     cache_syn: Option<Instant>,
     cache_fin: Option<Timer>,
     cache_fin_retrans: bool,
+    last_ack_progress: Instant,
     queue: VecDeque<u8>,
     queue_fin: bool,
     rto: u64,
@@ -606,6 +609,7 @@ impl TcpTxState {
             cache_syn: None,
             cache_fin: None,
             cache_fin_retrans: true,
+            last_ack_progress: Instant::now(),
             queue: VecDeque::new(),
             queue_fin: false,
             rto: INITIAL_RTO,
@@ -695,6 +699,7 @@ impl TcpTxState {
     #[allow(clippy::unnecessary_lazy_evaluations)]
     pub fn acknowledge(&mut self, sequence: u32) {
         let mut rtt = None;
+        let mut progressed = false;
 
         // SYN
         if let Some(instant) = self.cache_syn {
@@ -707,6 +712,7 @@ impl TcpTxState {
                 rtt = Some(instant.elapsed());
 
                 self.cache_syn = None;
+                progressed = true;
                 trace!("acknowledge TCP SYN of {} -> {}", self.dst, self.src);
 
                 // Update TCP sequence
@@ -720,7 +726,9 @@ impl TcpTxState {
             .unwrap_or_else(|| sequence + (u32::MAX - self.cache.sequence()));
         if sub_sequence > 0 && sub_sequence as usize <= MAX_U32_WINDOW_SIZE {
             // Invalidate cache
+            let old_size = self.cache.len();
             let cache_rtt = self.cache.invalidate_to(sequence);
+            progressed |= self.cache.len() < old_size;
             if rtt.is_none() {
                 rtt = cache_rtt;
             }
@@ -754,11 +762,17 @@ impl TcpTxState {
 
                 self.cache_fin = None;
                 self.cache_fin_retrans = false;
+                progressed = true;
                 trace!("acknowledge TCP FIN of {} -> {}", self.dst, self.src);
 
                 // Update TCP sequence
                 self.add_sequence(1);
             }
+        }
+
+        // Only new acknowledgement progress extends a stalled connection's life.
+        if progressed {
+            self.last_ack_progress = Instant::now();
         }
 
         // Update RTO
@@ -769,6 +783,9 @@ impl TcpTxState {
 
     /// Updates the TCP SYN timer of the TCP connection.
     pub fn update_syn_timer(&mut self) {
+        if self.cache_syn.is_none() && self.cache.len() == 0 && self.cache_fin.is_none() {
+            self.last_ack_progress = Instant::now();
+        }
         self.cache_syn = Some(Instant::now());
         trace!("update TCP SYN timer of {} -> {}", self.dst, self.src);
     }
@@ -816,13 +833,22 @@ impl TcpTxState {
             self.src
         );
         // TODO: intermediate performance degradation
+        let was_idle = self.cache.len() == 0
+            && self.cache_syn.is_none()
+            && self.cache_fin.is_none();
         self.cache.append(&payload, self.rto)?;
+        if was_idle && !payload.is_empty() {
+            self.last_ack_progress = Instant::now();
+        }
 
         Ok(payload)
     }
 
     /// Appends the TCP FIN from the queue to the cache of the TCP connection.
     pub fn append_cache_fin(&mut self) {
+        if self.cache.len() == 0 && self.cache_syn.is_none() && self.cache_fin.is_none() {
+            self.last_ack_progress = Instant::now();
+        }
         self.queue_fin = false;
         trace!(
             "append TCP FIN to TCP cache of {} -> {}",
@@ -992,6 +1018,14 @@ impl TcpTxState {
         MAX_QUEUE.saturating_sub(self.queue().len())
     }
 
+    /// Returns whether outstanding data have exceeded the ACK progress deadline.
+    pub fn is_stalled(&self) -> bool {
+        let pending = self.cache_syn.is_some()
+            || self.cache.len() > 0
+            || self.cache_fin.is_some();
+        pending && self.last_ack_progress.elapsed() >= MAX_UNACKNOWLEDGED_TIME
+    }
+
     /// Returns the RTO of the TCP connection.
     pub fn rto(&self) -> u64 {
         self.rto
@@ -1020,6 +1054,65 @@ impl TcpTxState {
         } else {
             self.src_window
         }
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn state() -> TcpTxState {
+        TcpTxState::new(
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 12345),
+            SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443),
+            100,
+            200,
+            65535,
+            None,
+            false,
+            None,
+            1460,
+        )
+    }
+
+    #[test]
+    fn expired_data_is_removed_by_acknowledgement() {
+        let mut state = state();
+        state.append_queue(&[42]);
+        state.append_cache(1).unwrap();
+        state.last_ack_progress = Instant::now() - MAX_UNACKNOWLEDGED_TIME;
+        assert!(state.is_stalled());
+
+        state.acknowledge(101);
+        assert!(!state.is_stalled());
+
+        // An idle stream must not expire, even after a long time.
+        state.last_ack_progress = Instant::now() - MAX_UNACKNOWLEDGED_TIME;
+        assert!(!state.is_stalled());
+        state.append_queue(&[42]);
+        state.append_cache(1).unwrap();
+        assert!(!state.is_stalled());
+    }
+
+    #[test]
+    fn duplicate_acks_do_not_extend_a_stalled_connection() {
+        let mut state = state();
+        state.append_queue(&[42]);
+        state.append_cache(1).unwrap();
+        state.last_ack_progress = Instant::now() - MAX_UNACKNOWLEDGED_TIME;
+        state.acknowledge(100);
+        assert!(state.is_stalled());
+    }
+
+    #[test]
+    fn unacknowledged_fin_expires() {
+        let mut state = state();
+        state.append_cache_fin();
+        state.last_ack_progress = Instant::now() - MAX_UNACKNOWLEDGED_TIME;
+        assert!(state.is_stalled());
+        state.acknowledge(101);
+        assert!(!state.is_stalled());
     }
 }
 

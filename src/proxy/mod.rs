@@ -14,6 +14,8 @@ mod socks;
 use socks::SocksSendHalf;
 use socks::{SocksAuth, SocksOption};
 
+pub(crate) type TcpTimeout = (SocketAddrV4, SocketAddrV4, u64);
+
 /// Represents the configuration of the proxy.
 pub enum ProxyConfig {
     /// Represents the SOCKS proxy configuration.
@@ -76,6 +78,7 @@ pub struct StreamWorker {
     tx_tx: UnboundedSender<Vec<u8>>,
     is_tx_closed: Arc<AtomicBool>,
     is_rx_closed: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
     tx_close_tx: Sender<()>,
     rx_close_tx: Sender<()>,
 }
@@ -87,6 +90,17 @@ impl StreamWorker {
         src: SocketAddrV4,
         dst: SocketAddrV4,
         proxy: &ProxyConfig,
+    ) -> io::Result<StreamWorker> {
+        Self::connect_with_cleanup(tx, src, dst, proxy, None).await
+    }
+
+    /// Opens a stream and reports stalled connections to its owning redirector.
+    pub(crate) async fn connect_with_cleanup(
+        tx: Arc<Mutex<dyn ForwardStream>>,
+        src: SocketAddrV4,
+        dst: SocketAddrV4,
+        proxy: &ProxyConfig,
+        timeout: Option<(UnboundedSender<TcpTimeout>, u64)>,
     ) -> io::Result<StreamWorker> {
         let tx_cloned = Arc::clone(&tx);
 
@@ -109,6 +123,8 @@ impl StreamWorker {
         let is_rx_closed_cloned = Arc::clone(&is_rx_closed);
         let (tx_close_tx, mut tx_close_rx) = mpsc::channel(1);
         let (rx_close_tx, mut rx_close_rx) = mpsc::channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_cloned = Arc::clone(&cancelled);
 
         // Send
         tokio::spawn(async move {
@@ -256,9 +272,23 @@ impl StreamWorker {
         tokio::spawn(async move {
             loop {
                 time::sleep(Duration::from_millis(TICK_INTERVAL)).await;
-                // Send
-                if let Err(ref e) = tx_cloned.lock().unwrap().tick(dst, src) {
+                // Check cancellation while holding the forwarder lock: an old timer
+                // must not operate on a new connection with the same four-tuple.
+                let result = {
+                    let mut forwarder = tx_cloned.lock().unwrap();
+                    if cancelled_cloned.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    forwarder.tick(dst, src)
+                };
+                if let Err(ref e) = result {
                     if e.kind() == io::ErrorKind::NotFound {
+                        return;
+                    }
+                    if e.kind() == io::ErrorKind::TimedOut {
+                        if let Some((ref sender, id)) = timeout {
+                            let _ = sender.send((src, dst, id));
+                        }
                         return;
                     }
                     warn!("handle timeout: {}: {} -> {}: {}", "TCP", dst, 0, e);
@@ -273,6 +303,7 @@ impl StreamWorker {
             tx_tx,
             is_tx_closed,
             is_rx_closed,
+            cancelled,
             tx_close_tx,
             rx_close_tx,
         })
@@ -310,6 +341,7 @@ impl StreamWorker {
 
     /// Closes the worker.
     pub fn close(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
         self.shutdown(Shutdown::Both);
     }
 

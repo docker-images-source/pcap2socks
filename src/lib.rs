@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use tokio::io;
+use tokio::sync::mpsc;
 
 pub mod packet;
 pub mod pcap;
@@ -23,7 +24,7 @@ pub mod stat;
 pub mod tcp;
 
 pub use self::proxy::ProxyConfig;
-use self::proxy::{DatagramWorker, ForwardDatagram, ForwardStream, StreamWorker};
+use self::proxy::{DatagramWorker, ForwardDatagram, ForwardStream, StreamWorker, TcpTimeout};
 use packet::layer::arp::Arp;
 use packet::layer::ethernet::Ethernet;
 use packet::layer::icmpv4::Icmpv4;
@@ -1078,6 +1079,15 @@ impl ForwardStream for Forwarder {
     }
 
     fn tick(&mut self, dst: SocketAddrV4, src: SocketAddrV4) -> io::Result<()> {
+        let state = self
+            .get_state(dst, src)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        if state.is_stalled() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "TCP acknowledgement stalled",
+            ));
+        }
         self.retransmit_tcp_timedout(dst, src)
     }
 
@@ -1186,6 +1196,10 @@ pub struct Redirector {
     proxy: ProxyConfig,
     streams: HashMap<(SocketAddrV4, SocketAddrV4), StreamWorker>,
     states: HashMap<(SocketAddrV4, SocketAddrV4), TcpRxState>,
+    stream_ids: HashMap<(SocketAddrV4, SocketAddrV4), u64>,
+    next_stream_id: u64,
+    tcp_timeout_tx: mpsc::UnboundedSender<TcpTimeout>,
+    tcp_timeout_rx: mpsc::UnboundedReceiver<TcpTimeout>,
     datagrams: HashMap<u16, DatagramWorker>,
     /// Represents the map mapping a source port to a local port.
     datagram_map: HashMap<SocketAddrV4, u16>,
@@ -1208,6 +1222,7 @@ impl Redirector {
     ) -> Redirector {
         let size = traffic.as_ref().map(|traffic| traffic.size());
         let count = traffic.as_ref().map(|traffic| traffic.count());
+        let (tcp_timeout_tx, tcp_timeout_rx) = mpsc::unbounded_channel();
         let redirector = Redirector {
             tx,
             tx_src_hardware_addr_set_ip_addr_set: HashSet::new(),
@@ -1217,6 +1232,10 @@ impl Redirector {
             proxy,
             streams: HashMap::new(),
             states: HashMap::new(),
+            stream_ids: HashMap::new(),
+            next_stream_id: 0,
+            tcp_timeout_tx,
+            tcp_timeout_rx,
             datagrams: HashMap::new(),
             datagram_map: HashMap::new(),
             udp_lru: LruCache::new(MAX_UDP_PORT),
@@ -1248,6 +1267,15 @@ impl Redirector {
         }
 
         loop {
+            // Drop stale streams on the receiving task, which owns both state maps.
+            // The pcap read timeout also wakes this loop on a quiet LAN.
+            while let Ok((src, dst, id)) = self.tcp_timeout_rx.try_recv() {
+                if self.stream_ids.get(&(src, dst)) == Some(&id) {
+                    debug!("clean up stalled TCP connection {} -> {}", src, dst);
+                    self.clean_up(src, dst);
+                }
+            }
+
             // Monitor
             if let Some(is_running) = &is_running {
                 if !is_running.load(Ordering::Relaxed) {
@@ -1275,7 +1303,10 @@ impl Redirector {
                     };
                 }
                 Err(e) => {
-                    if e.kind() == io::ErrorKind::TimedOut {
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) {
                         thread::sleep(Duration::from_millis(TIMEDOUT_WAIT));
                         continue;
                     }
@@ -1664,7 +1695,16 @@ impl Redirector {
             }
 
             // Connect
-            let stream = StreamWorker::connect(self.get_tx(), src, dst, &self.proxy).await;
+            self.next_stream_id = self.next_stream_id.wrapping_add(1);
+            let stream_id = self.next_stream_id;
+            let stream = StreamWorker::connect_with_cleanup(
+                self.get_tx(),
+                src,
+                dst,
+                &self.proxy,
+                Some((self.tcp_timeout_tx.clone(), stream_id)),
+            )
+            .await;
 
             let stream = match stream {
                 Ok(stream) => stream,
@@ -1689,6 +1729,7 @@ impl Redirector {
             };
 
             self.states.insert(key, state);
+            self.stream_ids.insert(key, stream_id);
             self.streams.insert(key, stream);
         }
 
@@ -1809,6 +1850,7 @@ impl Redirector {
     fn clean_up(&mut self, src: SocketAddrV4, dst: SocketAddrV4) {
         let key = (src, dst);
 
+        self.stream_ids.remove(&key);
         self.streams.remove(&key);
         self.states.remove(&key);
 
