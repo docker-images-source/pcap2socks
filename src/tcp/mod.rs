@@ -815,7 +815,12 @@ impl TcpTxState {
 
     /// Appends the payload from the queue to the cache of the TCP connection.
     pub fn append_cache(&mut self, size: usize) -> io::Result<Vec<u8>> {
-        let payload = self.queue.drain(..size).collect::<Vec<_>>();
+        if size > self.queue.len() || size > self.cache.remaining() {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock,
+                "TCP retransmission cache has insufficient space"));
+        }
+        // Never remove queued data before the retransmission cache accepts it.
+        let payload = self.queue.iter().take(size).copied().collect::<Vec<_>>();
 
         // Append to cache
         trace!(
@@ -829,6 +834,7 @@ impl TcpTxState {
             && self.cache_syn.is_none()
             && self.cache_fin.is_none();
         self.cache.append(&payload, self.rto)?;
+        self.queue.drain(..size);
         if was_idle && !payload.is_empty() {
             self.last_ack_progress = Instant::now();
         }
@@ -1117,6 +1123,17 @@ mod stall_tests {
         state.append_cache(3).unwrap();
         state.acknowledge(104);
         assert_eq!(state.cache().len(), 3);
+    }
+
+    #[test]
+    fn failed_cache_append_keeps_queued_payload() {
+        let mut state = state();
+        state.append_queue(&[1, 2, 3]);
+        // Force a full retransmission cache without consuming the send queue.
+        state.cache = Queue::with_capacity(2, 100);
+        assert!(state.append_cache(3).is_err());
+        assert_eq!(state.queue().iter().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(state.cache().len(), 0);
     }
 
     #[test]

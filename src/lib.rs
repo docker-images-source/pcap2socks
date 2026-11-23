@@ -516,6 +516,8 @@ impl Forwarder {
             // TCP sequence
             let sent_size = state.cache().len();
             let remain_size = state.send_window().saturating_sub(sent_size);
+            // The peer's scaled window may exceed our bounded retransmission cache.
+            let remain_size = min(remain_size, state.cache().remaining());
             let remain_size = min(remain_size, u16::MAX as usize) as u16;
 
             let mut size = min(remain_size as usize, state.queue().len());
