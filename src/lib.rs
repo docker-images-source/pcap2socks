@@ -1207,6 +1207,7 @@ pub struct Redirector {
     tcp_ready_tx: mpsc::UnboundedSender<TcpReady>,
     tcp_ready_rx: mpsc::UnboundedReceiver<TcpReady>,
     pending_tcp: HashMap<(SocketAddrV4, SocketAddrV4), (u64, tokio::task::JoinHandle<()>)>,
+    tcp_queued_bytes: Arc<AtomicUsize>,
     udp_ready_tx: mpsc::UnboundedSender<UdpReady>,
     udp_ready_rx: mpsc::UnboundedReceiver<UdpReady>,
     pending_udp: HashMap<SocketAddrV4, (u64, VecDeque<(Vec<u8>, SocketAddrV4)>)>,
@@ -1251,6 +1252,7 @@ impl Redirector {
             tcp_ready_tx,
             tcp_ready_rx,
             pending_tcp: HashMap::new(),
+            tcp_queued_bytes: Arc::new(AtomicUsize::new(0)),
             udp_ready_tx,
             udp_ready_rx,
             pending_udp: HashMap::new(),
@@ -1365,6 +1367,7 @@ impl Redirector {
                     let worker = StreamWorker::from_connected(
                         self.get_tx(), src, dst, stream,
                         Some((self.tcp_timeout_tx.clone(), id)),
+                        Arc::clone(&self.tcp_queued_bytes),
                     );
                     match worker {
                         Ok(worker) => {

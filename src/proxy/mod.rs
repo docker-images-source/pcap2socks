@@ -82,14 +82,30 @@ const MAX_RECV_ZERO: usize = 3;
 const TICK_INTERVAL: u64 = 500;
 /// Bound bytes queued for a SOCKS5 TCP writer; overflow closes the TCP connection.
 const MAX_TCP_PENDING_BYTES: usize = 8 * 1024 * 1024;
+/// Shared pending TCP payload budget across every active worker.
+const MAX_GLOBAL_TCP_PENDING_BYTES: usize = 64 * 1024 * 1024;
+
+/// Releases the shared budget when a queued or in-flight payload is dropped.
+struct QueuedTcpPayload {
+    bytes: Vec<u8>,
+    shared_bytes: Arc<AtomicUsize>,
+}
+
+impl Drop for QueuedTcpPayload {
+    fn drop(&mut self) {
+        self.shared_bytes.fetch_sub(self.bytes.len(), Ordering::Relaxed);
+    }
+}
+
 /// Maximum queued UDP datagrams per association.
 const MAX_UDP_PENDING_DATAGRAMS: usize = 256;
 
 /// Represents a worker of a proxied TCP stream.
 pub struct StreamWorker {
     dst: SocketAddrV4,
-    tx_tx: UnboundedSender<Vec<u8>>,
+    tx_tx: UnboundedSender<QueuedTcpPayload>,
     queued_bytes: Arc<AtomicUsize>,
+    global_queued_bytes: Arc<AtomicUsize>,
     is_tx_closed: Arc<AtomicBool>,
     is_rx_closed: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
@@ -117,7 +133,8 @@ impl StreamWorker {
         timeout: Option<(UnboundedSender<TcpTimeout>, u64)>,
     ) -> io::Result<StreamWorker> {
         let stream = proxy.connect_tcp(dst).await?;
-        Self::from_connected(tx, src, dst, stream, timeout)
+        Self::from_connected(tx, src, dst, stream, timeout,
+            Arc::new(AtomicUsize::new(0)))
     }
 
     /// Starts protocol handling only after the SOCKS handshake has completed.
@@ -127,6 +144,7 @@ impl StreamWorker {
         dst: SocketAddrV4,
         stream: tokio::net::TcpStream,
         timeout: Option<(UnboundedSender<TcpTimeout>, u64)>,
+        global_queued_bytes: Arc<AtomicUsize>,
     ) -> io::Result<StreamWorker> {
         let tx_cloned = Arc::clone(&tx);
         let (mut stream_rx, mut stream_tx) = stream.into_split();
@@ -134,8 +152,9 @@ impl StreamWorker {
         // Open only on the redirector's owner task; never on a stale connector.
         tx.lock().unwrap().open(dst, src)?;
 
-        let (tx_tx, mut tx_rx): (UnboundedSender<Vec<u8>>, UnboundedReceiver<Vec<u8>>) =
-            mpsc::unbounded_channel();
+        let (tx_tx, mut tx_rx): (
+            UnboundedSender<QueuedTcpPayload>, UnboundedReceiver<QueuedTcpPayload>
+        ) = mpsc::unbounded_channel();
         let queued_bytes = Arc::new(AtomicUsize::new(0));
         let queued_bytes_tx = Arc::clone(&queued_bytes);
         let is_tx_closed = Arc::new(AtomicBool::new(false));
@@ -158,17 +177,17 @@ impl StreamWorker {
                         None => break,
                     },
                 };
-                queued_bytes_tx.fetch_sub(payload.len(), Ordering::Relaxed);
+                queued_bytes_tx.fetch_sub(payload.bytes.len(), Ordering::Relaxed);
                 let result = tokio::select! {
                     biased;
                     _ = tx_close_rx.recv() => break,
                     result = time::timeout(Duration::from_secs(60),
-                        stream_tx.write_all(payload.as_slice())) => result,
+                        stream_tx.write_all(payload.bytes.as_slice())) => result,
                 };
                 match result {
                     Ok(Ok(())) => debug!(
                         "send to proxy: {}: {} -> {} ({} Bytes)",
-                        "TCP", 0, dst, payload.len()
+                        "TCP", 0, dst, payload.bytes.len()
                     ),
                     Ok(Err(e)) => {
                         warn!("handle send: TCP: {} -> {}: {}", 0, dst, e);
@@ -314,6 +333,7 @@ impl StreamWorker {
             dst,
             tx_tx,
             queued_bytes,
+            global_queued_bytes,
             is_tx_closed,
             is_rx_closed,
             cancelled,
@@ -328,7 +348,19 @@ impl StreamWorker {
         self.queued_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(size).filter(|&next| next <= MAX_TCP_PENDING_BYTES)
         }).map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "TCP proxy queue limit exceeded"))?;
-        if self.tx_tx.send(payload).is_err() {
+        if self.global_queued_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(size).filter(|&next| next <= MAX_GLOBAL_TCP_PENDING_BYTES)
+        }).is_err() {
+            self.queued_bytes.fetch_sub(size, Ordering::Relaxed);
+            return Err(io::Error::new(io::ErrorKind::OutOfMemory,
+                "global TCP proxy queue limit exceeded"));
+        }
+        let queued = QueuedTcpPayload {
+            bytes: payload,
+            shared_bytes: Arc::clone(&self.global_queued_bytes),
+        };
+        if self.tx_tx.send(queued).is_err() {
+            // The SendError owns `queued` and drops its shared-budget guard.
             self.queued_bytes.fetch_sub(size, Ordering::Relaxed);
             return Err(io::Error::from(io::ErrorKind::NotConnected));
         }
