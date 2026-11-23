@@ -4,7 +4,7 @@ use log::{debug, trace, warn};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::mpsc::{self, Sender, UnboundedReceiver, UnboundedSender};
@@ -133,51 +133,41 @@ impl StreamWorker {
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_cloned = Arc::clone(&cancelled);
 
-        // Send
+        // Send: cancellation remains selectable even while writing to a dead proxy.
         tokio::spawn(async move {
             loop {
-                let is_close;
-
-                // Select
-                {
-                    let tx_rx_fut = tx_rx.recv();
-                    let tx_close_rx_fut = tx_close_rx.recv();
-
-                    tokio::pin!(tx_rx_fut, tx_close_rx_fut);
-
-                    tokio::select! {
-                        r = tx_rx_fut => match r {
-                            Some(payload) => {
-                                queued_bytes_tx.fetch_sub(payload.len(), Ordering::Relaxed);
-                                match stream_tx.write_all(payload.as_slice()).await {
-                                    Ok(_) => {
-                                        debug!(
-                                            "send to proxy: {}: {} -> {} ({} Bytes)",
-                                            "TCP", 0, dst, payload.len()
-                                        );
-
-                                        is_close = false
-                                    },
-                                    Err(ref e) => {
-                                        warn!("handle send: {}: {} -> {}: {}", "TCP", 0, dst, e);
-
-                                        is_close = true
-                                    }
-                                };
-                            }
-                            None => is_close = true
-                        },
-                        _ = tx_close_rx_fut => is_close = true
+                let payload = tokio::select! {
+                    biased;
+                    _ = tx_close_rx.recv() => break,
+                    value = tx_rx.recv() => match value {
+                        Some(payload) => payload,
+                        None => break,
+                    },
+                };
+                queued_bytes_tx.fetch_sub(payload.len(), Ordering::Relaxed);
+                let result = tokio::select! {
+                    biased;
+                    _ = tx_close_rx.recv() => break,
+                    result = time::timeout(Duration::from_secs(60),
+                        stream_tx.write_all(payload.as_slice())) => result,
+                };
+                match result {
+                    Ok(Ok(())) => debug!(
+                        "send to proxy: {}: {} -> {} ({} Bytes)",
+                        "TCP", 0, dst, payload.len()
+                    ),
+                    Ok(Err(e)) => {
+                        warn!("handle send: TCP: {} -> {}: {}", 0, dst, e);
+                        break;
+                    }
+                    Err(_) => {
+                        warn!("SOCKS5 TCP write stalled: {}", dst);
+                        break;
                     }
                 }
-
-                if is_close {
-                    // Close
-                    is_tx_closed_cloned.store(true, Ordering::Relaxed);
-                    trace!("close stream TX {} -> {}", 0, dst);
-                    break;
-                }
             }
+            is_tx_closed_cloned.store(true, Ordering::Relaxed);
+            trace!("close stream TX {} -> {}", 0, dst);
         });
 
         // Receive
@@ -574,6 +564,7 @@ pub trait ForwardDatagram: Send {
 pub struct DatagramWorker {
     src: Arc<AtomicU64>,
     local_port: u16,
+    last_used: Instant,
     tx_tx: Sender<(Vec<u8>, SocketAddrV4)>,
     is_closed: Arc<AtomicBool>,
     close_tx: Sender<()>,
@@ -735,6 +726,7 @@ impl DatagramWorker {
             DatagramWorker {
                 src: a_src,
                 local_port,
+                last_used: Instant::now(),
                 tx_tx,
                 is_closed,
                 close_tx,
@@ -755,7 +747,14 @@ impl DatagramWorker {
                 mpsc::error::TrySendError::Closed(_) => io::ErrorKind::NotConnected,
             };
             io::Error::from(kind)
-        })
+        })?;
+        self.last_used = Instant::now();
+        Ok(())
+    }
+
+    /// Returns whether the association has been unused beyond the limit.
+    pub fn is_idle(&self, timeout: Duration) -> bool {
+        self.last_used.elapsed() >= timeout
     }
 
     /// Sets the source of the worker.

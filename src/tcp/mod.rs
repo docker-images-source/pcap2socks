@@ -1162,6 +1162,7 @@ pub struct TcpRxState {
     sack_perm: bool,
     cache: Window,
     fin_sequence: Option<u32>,
+    last_activity: Instant,
 }
 
 /// Bound the receive-cache allocation even when the peer advertises a large scale.
@@ -1196,7 +1197,18 @@ impl TcpRxState {
                 recv_next,
             ),
             fin_sequence: None,
+            last_activity: Instant::now(),
         }
+    }
+
+    /// Records activity from the local client.
+    pub fn touch(&mut self) {
+        self.last_activity = Instant::now();
+    }
+
+    /// Returns whether a client-side connection has been idle beyond the limit.
+    pub fn is_idle(&self, timeout: Duration) -> bool {
+        self.last_activity.elapsed() >= timeout
     }
 
     /// Adds receive next to the TCP connection.

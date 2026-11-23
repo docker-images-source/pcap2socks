@@ -1175,8 +1175,14 @@ const MAX_RECV_WSCALE: u8 = 8;
 
 /// Represents the max limit of UDP port for binding in local.
 const MAX_UDP_PORT: usize = 256;
+/// Retire idle UDP mappings instead of stealing a still-active association.
+const UDP_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 /// Represents the interval for reclaiming closed UDP associations.
 const UDP_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+/// Drop TCP sessions that have received no client traffic for two hours.
+const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+/// Avoid unbounded TCP stream and related cache proliferation.
+const MAX_TCP_STREAMS: usize = 256;
 
 /// Represents a channel redirect traffic to the proxy or loopback to the source in pcap.
 pub struct Redirector {
@@ -1261,6 +1267,15 @@ impl Redirector {
             if last_udp_cleanup.elapsed() >= UDP_CLEANUP_INTERVAL {
                 self.prune_closed_udp_ports();
                 self.defrag.prune_expired();
+                let expired: Vec<_> = self.states.iter()
+                    .filter(|(key, state)| self.streams.contains_key(key)
+                        && state.is_idle(TCP_IDLE_TIMEOUT))
+                    .map(|(key, _)| *key)
+                    .collect();
+                for (src, dst) in expired {
+                    debug!("expire idle TCP connection {} -> {}", src, dst);
+                    self.clean_up(src, dst);
+                }
                 last_udp_cleanup = Instant::now();
             }
             // Drop stale streams on the receiving task, which owns both state maps.
@@ -1475,6 +1490,7 @@ impl Redirector {
                 .states
                 .get_mut(&key)
                 .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            state.touch();
             if tcp.sequence() != state.recv_next() {
                 trace!(
                     "TCP out of order of {} -> {} at {}",
@@ -1651,6 +1667,11 @@ impl Redirector {
 
         // Connect if not connected, drop if established
         if !is_exist {
+            if self.streams.len() >= MAX_TCP_STREAMS {
+                // Do not evict an unrelated live connection to make room.
+                debug!("drop TCP SYN at active connection limit: {} -> {}", src, dst);
+                return Ok(());
+            }
             // Clean up
             self.clean_up(src, dst);
 
@@ -1893,11 +1914,9 @@ impl Redirector {
             return Err(io::Error::new(io::ErrorKind::AlreadyExists, "duplicate UDP socket port"));
         }
         if self.udp_lru.len() >= self.udp_lru.cap() {
-            if let Some((old_port, old_src)) = self.udp_lru.pop_lru() {
-                self.datagram_map.remove(&old_src);
-                self.datagrams.remove(&old_port);
-                trace!("evict UDP association {} = {}", old_port, old_src);
-            }
+            // A live association must never be stolen or evicted on a bind.
+            return Err(io::Error::new(io::ErrorKind::WouldBlock,
+                "UDP association capacity reached"));
         }
         self.datagrams.insert(port, worker);
         self.datagram_map.insert(src, port);
@@ -1910,7 +1929,8 @@ impl Redirector {
         let closed: Vec<u16> = self
             .datagrams
             .iter()
-            .filter_map(|(&port, worker)| worker.is_closed().then_some(port))
+            .filter_map(|(&port, worker)|
+                (worker.is_closed() || worker.is_idle(UDP_IDLE_TIMEOUT)).then_some(port))
             .collect();
         for port in closed {
             if let Some(src) = self.udp_lru.pop(&port) {
