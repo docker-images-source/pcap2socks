@@ -345,10 +345,10 @@ impl StreamWorker {
     /// Sends data on the proxied stream in TCP to the destination.
     pub fn send(&mut self, payload: Vec<u8>) -> io::Result<()> {
         let size = payload.len();
-        self.queued_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        self.queued_bytes.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(size).filter(|&next| next <= MAX_TCP_PENDING_BYTES)
         }).map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "TCP proxy queue limit exceeded"))?;
-        if self.global_queued_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        if self.global_queued_bytes.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(size).filter(|&next| next <= MAX_GLOBAL_TCP_PENDING_BYTES)
         }).is_err() {
             self.queued_bytes.fetch_sub(size, Ordering::Relaxed);

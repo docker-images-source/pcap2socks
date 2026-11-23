@@ -40,9 +40,6 @@ impl Timer {
     }
 }
 
-/// Represents the max distance of `u32` values between packets in an `u32` window.
-const MAX_U32_WINDOW_SIZE: usize = 16 * 1024 * 1024;
-
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 /// Enumeration of congestion control algorithms.
 pub enum TcpCcAlgorithms {
