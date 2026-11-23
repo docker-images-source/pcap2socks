@@ -143,13 +143,16 @@ impl Indicator {
                             icmpv4.description()
                         ),
                         Layers::Tcp(tcp) => format!(
-                            "{}: {}:{} -> {}:{} {}",
+                            "{}: {}:{} -> {}:{} {} SEQ={} ACK={} WIN={}",
                             tcp.kind(),
                             tcp.src_ip_addr(),
                             tcp.src(),
                             tcp.dst_ip_addr(),
                             tcp.dst(),
                             tcp.flag_string(),
+                            tcp.sequence(),
+                            tcp.acknowledgement(),
+                            tcp.window(),
                         ),
                         Layers::Udp(udp) => format!(
                             "{}: {}:{} -> {}:{}, Length = {}",

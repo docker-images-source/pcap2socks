@@ -187,7 +187,7 @@ impl StreamWorker {
                         stream_tx.write_all(payload.bytes.as_slice())) => result,
                 };
                 match result {
-                    Ok(Ok(())) => debug!(
+                    Ok(Ok(())) => trace!(
                         "send to proxy: {}: {} -> {} ({} Bytes)",
                         "TCP", src, dst, payload.bytes.len()
                     ),
@@ -225,7 +225,7 @@ impl StreamWorker {
                     tokio::select! {
                         r = stream_rx_fut => match r {
                             Ok(this_size) => if this_size > 0 {
-                                debug!(
+                                trace!(
                                     "receive from proxy: {}: {} -> {} ({} Bytes)",
                                     "TCP", dst, src, this_size
                                 );
@@ -482,7 +482,7 @@ impl StreamWorker2 {
                     tokio::select! {
                         r = stream_rx_fut => match r {
                             Ok(this_size) => if this_size > 0 {
-                                debug!(
+                                trace!(
                                     "receive from proxy: {}: {} -> {} ({} Bytes)",
                                     "TCP", dst, src, this_size
                                 );
@@ -563,7 +563,7 @@ impl StreamWorker2 {
             Some(tx) => tx.write_all(payload).await?,
             None => return Err(io::Error::from(io::ErrorKind::NotConnected)),
         }
-        debug!(
+        trace!(
             "send to proxy: {}: {} -> {} ({} Bytes)",
             "TCP",
             self.src,
@@ -681,7 +681,7 @@ impl DatagramWorker {
                             Some((payload, dst)) => {
                                 match socks_tx.send_to(payload.as_slice(), dst).await {
                                     Ok(size) => {
-                                        debug!(
+                                        trace!(
                                             "send to proxy: {}: {} -> {} ({} Bytes)",
                                             "UDP", local_port, dst, size
                                         );
@@ -727,7 +727,7 @@ impl DatagramWorker {
                         socks_rx_result = socks_rx_fut => {
                             match socks_rx_result {
                                 Ok((this_size, this_addr)) => {
-                                    debug!(
+                                    trace!(
                                         "receive from proxy: {}: {} -> {} ({} Bytes)",
                                         "UDP", this_addr, local_port, this_size
                                     );
@@ -897,7 +897,7 @@ impl DatagramWorker2 {
                         socks_rx_result = socks_rx_fut => {
                             match socks_rx_result {
                                 Ok((this_size, this_addr)) => {
-                                    debug!(
+                                    trace!(
                                         "receive from proxy: {}: {} -> {} ({} Bytes)",
                                         "UDP", this_addr, local_port, this_size
                                     );
@@ -970,7 +970,7 @@ impl DatagramWorker2 {
     pub async fn send_to(&mut self, payload: &[u8], dst: SocketAddrV4) -> io::Result<usize> {
         // Send
         let size = self.socks_tx.send_to(payload, dst).await?;
-        debug!(
+        trace!(
             "send to proxy {}: {} -> {} ({} Bytes)",
             "UDP", self.local_port, dst, size
         );

@@ -1023,7 +1023,7 @@ impl Forwarder {
         .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "pcap transmit buffer unavailable"))??;
         match result {
             Some(e) => return Err(e),
-            None => debug!("send to pcap: {} ({} Bytes)", indicator.brief(), size),
+            None => trace!("send to pcap: {} ({} Bytes)", indicator.brief(), size),
         }
 
         // Monitor
@@ -1053,7 +1053,7 @@ impl Forwarder {
             .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "pcap transmit buffer unavailable"))??;
         match result {
             Some(e) => return Err(e),
-            None => debug!(
+            None => trace!(
                 "send to pcap: {} ({} + {} Bytes)",
                 indicator.brief(),
                 size,
@@ -1500,7 +1500,7 @@ impl Redirector {
                     && arp.dst() == gw_ip_addr
                 {
                     let src = arp.src();
-                    debug!(
+                    trace!(
                         "receive from pcap: {} ({} Bytes)",
                         indicator.brief(),
                         indicator.len()
@@ -1531,7 +1531,7 @@ impl Redirector {
             let src = ipv4.src();
             if self.should_proxy_ipv4(src, ipv4.dst()) {
                 let src = ipv4.src();
-                debug!(
+                trace!(
                     "receive from pcap: {} ({} + {} Bytes)",
                     indicator.brief(),
                     indicator.len(),
@@ -2146,9 +2146,7 @@ mod local_destination_tests {
             Ipv4Network::new(client, 32).unwrap(),
             gateway,
             Some(gateway),
-            ProxyConfig::new_socks(
-                SocketAddrV4::new(host, 1083), false, false, None,
-            ),
+            ProxyConfig::new_socks(SocketAddrV4::new(host, 1083), false, false, None),
             None,
         );
 
