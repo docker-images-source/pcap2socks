@@ -576,6 +576,10 @@ impl Forwarder {
         Ok(())
     }
 
+    fn fin_for_segment(is_fin: bool, end: usize, total: usize) -> bool {
+        is_fin && end == total
+    }
+
     fn send_tcp_ack(
         &mut self,
         dst: SocketAddrV4,
@@ -587,8 +591,9 @@ impl Forwarder {
         // Segmentation
         let mss = *self.src_mtu_map.get(src.ip()).unwrap_or(&self.local_mtu)
             - (Ipv4::minimum_len() + Tcp::minimum_len());
+        let payload_len = payload.len();
         let mut i = 0;
-        while mss * i < payload.len() {
+        while mss * i < payload_len {
             let state = self
                 .get_state(dst, src)
                 .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
@@ -599,7 +604,7 @@ impl Forwarder {
 
             // TCP
             let tcp;
-            if is_fin && mss * (i + 1) >= payload.len() {
+            if Self::fin_for_segment(is_fin, i * mss + size, payload_len) {
                 // ACK/FIN
                 tcp = Tcp::new_ack_fin(
                     dst.port(),
@@ -2035,5 +2040,18 @@ impl Redirector {
         if self.tx.lock().unwrap().set_src_hardware_addr(ip_addr, hardware_addr) {
             info!("Device {} ({}) joined or updated its address", ip_addr, hardware_addr);
         }
+    }
+}
+
+#[cfg(test)]
+mod tcp_segmentation_tests {
+    use super::Forwarder;
+
+    #[test]
+    fn fin_is_only_attached_to_the_final_segment() {
+        assert!(!Forwarder::fin_for_segment(true, 1460, 3000));
+        assert!(!Forwarder::fin_for_segment(true, 2920, 3000));
+        assert!(Forwarder::fin_for_segment(true, 3000, 3000));
+        assert!(!Forwarder::fin_for_segment(false, 3000, 3000));
     }
 }
