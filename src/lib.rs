@@ -1891,24 +1891,26 @@ impl Redirector {
         let dst = SocketAddrV4::new(tcp.dst_ip_addr(), tcp.dst());
         let key = (src, dst);
 
-        if tcp.is_ack() {
-            match self.states.get(&key) {
-                Some(state) => {
-                    // Exam ACK
-                    if tcp.sequence() == state.recv_next() {
-                        // Admit RST
-                        // Clean up
-                        self.clean_up(src, dst);
-                    }
-                }
-                None => {
-                    // Clean up
-                    self.clean_up(src, dst);
-                }
+        // Validate every RST against RCV.NXT, regardless of the ACK flag.
+        // A matching four-tuple alone must not allow a stale RST to tear down
+        // an established connection.
+        match self.states.get(&key).map(|state| state.recv_next()) {
+            Some(recv_next) if tcp.sequence() == recv_next => {
+                self.clean_up(src, dst);
             }
-        } else {
-            // Clean up
-            self.clean_up(src, dst);
+            Some(recv_next) => {
+                trace!(
+                    "ignore TCP RST of {} -> {} at {} (expected {})",
+                    src,
+                    dst,
+                    tcp.sequence(),
+                    recv_next
+                );
+            }
+            None => {
+                // Preserve cleanup of pending or otherwise untracked connections.
+                self.clean_up(src, dst);
+            }
         }
     }
 
@@ -2113,6 +2115,90 @@ mod tcp_segmentation_tests {
         assert!(!Forwarder::fin_for_segment(true, 2920, 3000));
         assert!(Forwarder::fin_for_segment(true, 3000, 3000));
         assert!(!Forwarder::fin_for_segment(false, 3000, 3000));
+    }
+}
+
+#[cfg(test)]
+mod tcp_rst_validation_tests {
+    use super::*;
+
+    fn redirector() -> Redirector {
+        let local = Ipv4Addr::new(192, 0, 2, 250);
+        let forwarder = Forwarder::new(
+            Box::new(pcap::BlackHole::new()),
+            1500,
+            pcap::HARDWARE_ADDR_UNSPECIFIED,
+            local,
+        );
+        Redirector::new(
+            Arc::new(Mutex::new(forwarder)),
+            Ipv4Network::new(Ipv4Addr::new(192, 0, 2, 0), 24).unwrap(),
+            local,
+            None,
+            ProxyConfig::new_socks(
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1080), false, false, None,
+            ),
+            None,
+        )
+    }
+
+    fn rst_packet(src: SocketAddrV4, dst: SocketAddrV4, sequence: u32) -> Tcp {
+        let mut tcp = Tcp::new_rst(src.port(), dst.port(), sequence, 0, 0, None);
+        let ipv4 = Ipv4::new(0, LayerKinds::Tcp, *src.ip(), *dst.ip()).unwrap();
+        tcp.set_ipv4_layer(&ipv4);
+        tcp
+    }
+
+    fn add_connection(
+        redirector: &mut Redirector,
+        src: SocketAddrV4,
+        dst: SocketAddrV4,
+        recv_next: u32,
+    ) {
+        redirector.states.insert(
+            (src, dst),
+            TcpRxState::new(src, dst, recv_next.wrapping_sub(1), 0, 0, false),
+        );
+    }
+
+    #[test]
+    fn rst_without_ack_with_wrong_sequence_does_not_remove_connection() {
+        let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 40000);
+        let dst = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 443);
+        let recv_next = 1000;
+        let mut redirector = redirector();
+        add_connection(&mut redirector, src, dst, recv_next);
+
+        redirector.handle_tcp_rst(&rst_packet(src, dst, recv_next.wrapping_add(1)));
+
+        assert!(redirector.states.contains_key(&(src, dst)));
+    }
+
+    #[test]
+    fn rst_without_ack_with_exact_sequence_removes_connection() {
+        let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 40000);
+        let dst = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 443);
+        let recv_next = 1000;
+        let mut redirector = redirector();
+        add_connection(&mut redirector, src, dst, recv_next);
+
+        redirector.handle_tcp_rst(&rst_packet(src, dst, recv_next));
+
+        assert!(!redirector.states.contains_key(&(src, dst)));
+    }
+
+    #[test]
+    fn rst_sequence_validation_handles_wraparound() {
+        let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 40000);
+        let dst = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 443);
+        let mut redirector = redirector();
+        add_connection(&mut redirector, src, dst, 0);
+
+        redirector.handle_tcp_rst(&rst_packet(src, dst, u32::MAX));
+        assert!(redirector.states.contains_key(&(src, dst)));
+
+        redirector.handle_tcp_rst(&rst_packet(src, dst, 0));
+        assert!(!redirector.states.contains_key(&(src, dst)));
     }
 }
 
