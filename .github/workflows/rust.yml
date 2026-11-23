@@ -17,7 +17,7 @@ jobs:
           - macos-latest
 
     steps:
-    - uses: actions/checkout@v2
+    - uses: actions/checkout@v7
     - name: Download dependencies
       run:  |
             Invoke-WebRequest -OutFile WpdPack.zip https://www.winpcap.org/install/bin/WpdPack_4_1_2.zip
@@ -29,13 +29,13 @@ jobs:
     - name: Run tests
       run: cargo test --release --verbose
     - name: Upload a build artifact
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v7
       with:
         name: pcap2socks-latest-${{ runner.os }}-amd64
         path: ./target/release/pcap2socks
       if: matrix.os != 'windows-latest'
     - name: Update a build artifact (Windows)
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v7
       with:
         name: pcap2socks-latest-${{ runner.os }}-amd64
         path: ./target/release/pcap2socks.exe
