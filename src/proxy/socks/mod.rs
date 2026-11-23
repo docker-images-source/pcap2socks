@@ -242,7 +242,10 @@ pub async fn bind(
 
     let proxy_addr = match datagram.proxy_addr().clone() {
         AddrKind::Ip(proxy_addr) => proxy_addr,
-        _ => unimplemented!(),
+        _ => return Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            "unsupported SOCKS5 UDP ASSOCIATE address type",
+        )),
     };
     let (stream, socket) = datagram.into_inner();
 
@@ -253,10 +256,10 @@ pub async fn bind(
                 true => false,
                 false => proxy_addr.ip().is_private(),
             },
-            SocketAddr::V6(_) => match options.force_associate_bind_addr {
-                true => panic!("IPv6 is not supported yet"),
-                false => true,
-            },
+            SocketAddr::V6(_) => return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "IPv6 SOCKS5 UDP association is not supported",
+            )),
         };
     if is_rewrite {
         let next_proxy_addr = SocketAddrV4::new(*remote.ip(), proxy_addr.port());

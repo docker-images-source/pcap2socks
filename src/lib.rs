@@ -1192,6 +1192,15 @@ const MAX_TCP_STREAMS: usize = 256;
 const MAX_PENDING_TCP_CONNECTS: usize = 64;
 const MAX_PENDING_UDP_ASSOCIATIONS: usize = 64;
 const MAX_PENDING_UDP_DATAGRAMS: usize = 32;
+/// Longer than the SOCKS connect and associate timeouts combined.
+const UDP_ASSOCIATE_DEADLINE: Duration = Duration::from_secs(20);
+
+struct PendingUdpAssociation {
+    id: u64,
+    started: Instant,
+    task: tokio::task::JoinHandle<()>,
+    datagrams: VecDeque<(Vec<u8>, SocketAddrV4)>,
+}
 
 type TcpReady = (SocketAddrV4, SocketAddrV4, u64, io::Result<tokio::net::TcpStream>);
 type UdpReady = (SocketAddrV4, u64, io::Result<(DatagramWorker, u16)>);
@@ -1215,7 +1224,7 @@ pub struct Redirector {
     tcp_queued_bytes: Arc<AtomicUsize>,
     udp_ready_tx: mpsc::UnboundedSender<UdpReady>,
     udp_ready_rx: mpsc::UnboundedReceiver<UdpReady>,
-    pending_udp: HashMap<SocketAddrV4, (u64, VecDeque<(Vec<u8>, SocketAddrV4)>)>,
+    pending_udp: HashMap<SocketAddrV4, PendingUdpAssociation>,
     next_udp_id: u64,
     datagrams: HashMap<u16, DatagramWorker>,
     /// Represents the map mapping a source port to a local port.
@@ -1318,6 +1327,7 @@ impl Redirector {
             }
 
             self.poll_connect_results();
+            self.prune_abandoned_udp_associations();
 
             // Monitor
             if let Some(is_running) = &is_running {
@@ -1387,10 +1397,10 @@ impl Redirector {
         }
 
         while let Ok((src, id, result)) = self.udp_ready_rx.try_recv() {
-            if self.pending_udp.get(&src).map(|(generation, _)| *generation) != Some(id) {
+            if self.pending_udp.get(&src).map(|pending| pending.id) != Some(id) {
                 continue;
             }
-            let (_, pending) = self.pending_udp.remove(&src).unwrap();
+            let pending = self.pending_udp.remove(&src).unwrap();
             match result {
                 Ok((worker, port)) => {
                     self.prune_closed_udp_ports();
@@ -1401,7 +1411,7 @@ impl Redirector {
                     self.datagrams.insert(port, worker);
                     self.datagram_map.insert(src, port);
                     self.udp_lru.put(port, src);
-                    for (payload, dst) in pending {
+                    for (payload, dst) in pending.datagrams {
                         if let Some(worker) = self.datagrams.get_mut(&port) {
                             if let Err(e) = worker.send_to(payload, dst) {
                                 if e.kind() != io::ErrorKind::WouldBlock {
@@ -1413,6 +1423,20 @@ impl Redirector {
                     }
                 }
                 Err(e) => warn!("create UDP SOCKS association for {}: {}", src, e),
+            }
+        }
+    }
+
+    /// Aborted or panicked connectors must never consume pending slots forever.
+    fn prune_abandoned_udp_associations(&mut self) {
+        let expired: Vec<_> = self.pending_udp.iter()
+            .filter(|(_, pending)| pending.started.elapsed() >= UDP_ASSOCIATE_DEADLINE)
+            .map(|(&src, _)| src)
+            .collect();
+        for src in expired {
+            if let Some(pending) = self.pending_udp.remove(&src) {
+                pending.task.abort();
+                warn!("expire unfinished SOCKS5 UDP association for {}", src);
             }
         }
     }
@@ -1980,9 +2004,9 @@ impl Redirector {
             }
             self.unbind_local_udp_port(src);
         }
-        if let Some((_, queued)) = self.pending_udp.get_mut(&src) {
-            if queued.len() < MAX_PENDING_UDP_DATAGRAMS {
-                queued.push_back((payload.to_vec(), dst));
+        if let Some(pending) = self.pending_udp.get_mut(&src) {
+            if pending.datagrams.len() < MAX_PENDING_UDP_DATAGRAMS {
+                pending.datagrams.push_back((payload.to_vec(), dst));
             }
             return Ok(());
         }
@@ -1995,13 +2019,18 @@ impl Redirector {
         let sender = self.udp_ready_tx.clone();
         let proxy = self.proxy.clone();
         let forwarder = self.get_tx();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let result = DatagramWorker::bind(forwarder, src, &proxy).await;
             let _ = sender.send((src, id, result));
         });
-        let mut pending = VecDeque::new();
-        pending.push_back((payload.to_vec(), dst));
-        self.pending_udp.insert(src, (id, pending));
+        let mut datagrams = VecDeque::new();
+        datagrams.push_back((payload.to_vec(), dst));
+        self.pending_udp.insert(src, PendingUdpAssociation {
+            id,
+            started: Instant::now(),
+            task,
+            datagrams,
+        });
         Ok(())
     }
 
