@@ -5,10 +5,12 @@ use std::cmp::{max, min};
 use std::collections::VecDeque;
 use std::fmt::{self, Display};
 use std::net::SocketAddrV4;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io;
 
 mod cache;
+pub use cache::CacheBudget;
 use cache::{Queue, Window};
 
 /// Represents a timer.
@@ -1199,6 +1201,11 @@ impl TcpRxState {
             fin_sequence: None,
             last_activity: Instant::now(),
         }
+    }
+
+    /// Install the redirector-wide receive budget before appending data.
+    pub fn set_cache_budget(&mut self, budget: Arc<CacheBudget>) {
+        self.cache.set_budget(budget);
     }
 
     /// Records activity from the local client.

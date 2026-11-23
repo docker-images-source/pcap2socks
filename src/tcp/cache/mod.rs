@@ -5,9 +5,35 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt::{self, Display};
 use std::io::{Error, ErrorKind, Result};
 use std::ops::Bound::Included;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::Timer;
+
+/// An aggregate budget for growable receive windows owned by one redirector.
+#[derive(Debug)]
+pub struct CacheBudget {
+    used: AtomicUsize,
+    limit: usize,
+}
+
+impl CacheBudget {
+    pub fn new(limit: usize) -> CacheBudget {
+        CacheBudget { used: AtomicUsize::new(0), limit }
+    }
+
+    fn reserve(&self, bytes: usize) -> Result<()> {
+        self.used.try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            used.checked_add(bytes).filter(|&next| next <= self.limit)
+        }).map_err(|_| Error::new(ErrorKind::OutOfMemory, "TCP receive cache budget exceeded"))?;
+        Ok(())
+    }
+
+    fn release(&self, bytes: usize) {
+        self.used.fetch_sub(bytes, Ordering::Relaxed);
+    }
+}
 
 /// Represents the max distance of u32 values between packets in an u32 window.
 const MAX_U32_WINDOW_SIZE: usize = 16 * 1024 * 1024;
@@ -433,6 +459,15 @@ pub struct Window {
     size: usize,
     /// Represents edges of filled values. Use an u64 instead of an u32 because the sequence is used as a ring.
     edges: BTreeMap<u64, usize>,
+    budget: Option<Arc<CacheBudget>>,
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        if let Some(budget) = &self.budget {
+            budget.release(self.buffer.len());
+        }
+    }
 }
 
 impl Window {
@@ -454,7 +489,14 @@ impl Window {
             head: 0,
             size: 0,
             edges: BTreeMap::new(),
+            budget: None,
         }
+    }
+
+    /// Assign the shared memory budget before the window receives data.
+    pub fn set_budget(&mut self, budget: Arc<CacheBudget>) {
+        debug_assert!(self.buffer.is_empty() && self.budget.is_none());
+        self.budget = Some(budget);
     }
 
     /// Appends some bytes to the window and returns continuous bytes from the beginning.
@@ -492,6 +534,9 @@ impl Window {
                     size,
                 ),
             );
+            if let Some(budget) = &self.budget {
+                budget.reserve(new_len - prev_len)?;
+            }
             self.buffer.resize(new_len, 0);
 
             // From the begin of the buffer to the tail
@@ -757,6 +802,18 @@ impl Display for Window {
 fn window_new() {
     let w = Window::with_capacity(0, 0);
     assert_eq!(w.to_string(), "[]");
+}
+
+#[test]
+fn shared_receive_budget_is_released() {
+    let budget = Arc::new(CacheBudget::new(8));
+    let mut window = Window::with_capacity(32, 0);
+    window.set_budget(Arc::clone(&budget));
+    assert!(window.append(2, &[2, 3, 4, 5, 6, 7]).unwrap().is_none());
+    assert_eq!(budget.used.load(Ordering::Relaxed), 8);
+    assert!(window.append(8, &[8]).is_err());
+    drop(window);
+    assert_eq!(budget.used.load(Ordering::Relaxed), 0);
 }
 
 #[test]

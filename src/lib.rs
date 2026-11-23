@@ -35,7 +35,7 @@ use packet::layer::{Layer, LayerKinds, Layers};
 use packet::{Defraggler, Indicator};
 use pcap::Interface;
 use pcap::{HardwareAddr, Receiver, Sender};
-use tcp::{TcpRxState, TcpTxState};
+use tcp::{CacheBudget, TcpRxState, TcpTxState};
 
 /// Gets a list of available network interfaces for the current machine.
 pub fn interfaces() -> Vec<Interface> {
@@ -1188,6 +1188,8 @@ const UDP_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 /// Avoid unbounded TCP stream and related cache proliferation.
 const MAX_TCP_STREAMS: usize = 256;
+/// Shared limit on the actual growable TCP receive-window byte buffers.
+const MAX_GLOBAL_TCP_RX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// Bound proxy handshakes and buffered initial UDP datagrams.
 const MAX_PENDING_TCP_CONNECTS: usize = 64;
 const MAX_PENDING_UDP_ASSOCIATIONS: usize = 64;
@@ -1222,6 +1224,7 @@ pub struct Redirector {
     tcp_ready_rx: mpsc::UnboundedReceiver<TcpReady>,
     pending_tcp: HashMap<(SocketAddrV4, SocketAddrV4), (u64, tokio::task::JoinHandle<()>)>,
     tcp_queued_bytes: Arc<AtomicUsize>,
+    tcp_rx_cache_budget: Arc<CacheBudget>,
     udp_ready_tx: mpsc::UnboundedSender<UdpReady>,
     udp_ready_rx: mpsc::UnboundedReceiver<UdpReady>,
     pending_udp: HashMap<SocketAddrV4, PendingUdpAssociation>,
@@ -1267,6 +1270,7 @@ impl Redirector {
             tcp_ready_rx,
             pending_tcp: HashMap::new(),
             tcp_queued_bytes: Arc::new(AtomicUsize::new(0)),
+            tcp_rx_cache_budget: Arc::new(CacheBudget::new(MAX_GLOBAL_TCP_RX_CACHE_BYTES)),
             udp_ready_tx,
             udp_ready_rx,
             pending_udp: HashMap::new(),
@@ -1816,10 +1820,11 @@ impl Redirector {
             // Our advertised scale is independent of the peer's scale.
             let recv_wscale = wscale.map(|_| MAX_RECV_WSCALE);
             let sack_perm = ENABLE_SACK && tcp.is_sack_perm();
-            let state = TcpRxState::new(
+            let mut state = TcpRxState::new(
                 src, dst, tcp.sequence(), wscale.unwrap_or(0),
                 recv_wscale.unwrap_or(0), sack_perm,
             );
+            state.set_cache_budget(Arc::clone(&self.tcp_rx_cache_budget));
 
             {
                 let mut tx_locked = self.tx.lock().unwrap();
