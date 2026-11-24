@@ -568,6 +568,7 @@ pub struct TcpTxState {
     cache_syn: Option<Instant>,
     cache_fin: Option<Timer>,
     cache_fin_retrans: bool,
+    fin_acknowledged: bool,
     last_ack_progress: Instant,
     queue: VecDeque<u8>,
     queue_fin: bool,
@@ -619,6 +620,7 @@ impl TcpTxState {
             cache_syn: None,
             cache_fin: None,
             cache_fin_retrans: true,
+            fin_acknowledged: false,
             last_ack_progress: Instant::now(),
             queue: VecDeque::new(),
             queue_fin: false,
@@ -766,6 +768,7 @@ impl TcpTxState {
                 }
 
                 self.cache_fin = None;
+                self.fin_acknowledged = true;
                 self.cache_fin_retrans = false;
                 progressed = true;
                 trace!("acknowledge TCP FIN of {} -> {}", self.dst, self.src);
@@ -1028,6 +1031,10 @@ impl TcpTxState {
     /// Returns the TCP FIN in the cache of the TCP connection.
     pub fn cache_fin(&self) -> Option<Timer> {
         self.cache_fin
+    }
+
+    pub(crate) fn fin_acknowledged(&self) -> bool {
+        self.fin_acknowledged
     }
 
     /// Returns the queue of the TCP connection.

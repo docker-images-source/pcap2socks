@@ -14,7 +14,12 @@ mod socks;
 use socks::SocksSendHalf;
 use socks::{SocksAuth, SocksOption};
 
-pub(crate) type TcpTimeout = (SocketAddrV4, SocketAddrV4, u64);
+pub(crate) enum TcpWorkerEvent {
+    WriteClosed,
+    Stalled,
+}
+
+pub(crate) type TcpEvent = (SocketAddrV4, SocketAddrV4, u64, TcpWorkerEvent);
 
 /// Represents the configuration of the proxy.
 #[derive(Clone)]
@@ -104,7 +109,7 @@ const MAX_UDP_PENDING_DATAGRAMS: usize = 256;
 pub struct StreamWorker {
     src: SocketAddrV4,
     dst: SocketAddrV4,
-    tx_tx: UnboundedSender<QueuedTcpPayload>,
+    tx_tx: Option<UnboundedSender<QueuedTcpPayload>>,
     queued_bytes: Arc<AtomicUsize>,
     global_queued_bytes: Arc<AtomicUsize>,
     is_tx_closed: Arc<AtomicBool>,
@@ -131,10 +136,10 @@ impl StreamWorker {
         src: SocketAddrV4,
         dst: SocketAddrV4,
         proxy: &ProxyConfig,
-        timeout: Option<(UnboundedSender<TcpTimeout>, u64)>,
+        events: Option<(UnboundedSender<TcpEvent>, u64)>,
     ) -> io::Result<StreamWorker> {
         let stream = proxy.connect_tcp(dst).await?;
-        Self::from_connected(tx, src, dst, stream, timeout,
+        Self::from_connected(tx, src, dst, stream, events,
             Arc::new(AtomicUsize::new(0)))
     }
 
@@ -144,7 +149,7 @@ impl StreamWorker {
         src: SocketAddrV4,
         dst: SocketAddrV4,
         stream: tokio::net::TcpStream,
-        timeout: Option<(UnboundedSender<TcpTimeout>, u64)>,
+        events: Option<(UnboundedSender<TcpEvent>, u64)>,
         global_queued_bytes: Arc<AtomicUsize>,
     ) -> io::Result<StreamWorker> {
         let tx_cloned = Arc::clone(&tx);
@@ -167,6 +172,8 @@ impl StreamWorker {
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_cloned = Arc::clone(&cancelled);
         let cancelled_rx = Arc::clone(&cancelled);
+
+        let writer_events = events.clone();
 
         // Send: cancellation remains selectable even while writing to a dead proxy.
         tokio::spawn(async move {
@@ -201,7 +208,11 @@ impl StreamWorker {
                     }
                 }
             }
+            drop(stream_tx);
             is_tx_closed_cloned.store(true, Ordering::Relaxed);
+            if let Some((sender, id)) = writer_events {
+                let _ = sender.send((src, dst, id, TcpWorkerEvent::WriteClosed));
+            }
             debug!("close stream TX {} -> {}", src, dst);
         });
 
@@ -333,8 +344,8 @@ impl StreamWorker {
                         return;
                     }
                     if e.kind() == io::ErrorKind::TimedOut {
-                        if let Some((ref sender, id)) = timeout {
-                            let _ = sender.send((src, dst, id));
+                        if let Some((ref sender, id)) = events {
+                            let _ = sender.send((src, dst, id, TcpWorkerEvent::Stalled));
                         }
                         return;
                     }
@@ -348,7 +359,7 @@ impl StreamWorker {
         Ok(StreamWorker {
             src,
             dst,
-            tx_tx,
+            tx_tx: Some(tx_tx),
             queued_bytes,
             global_queued_bytes,
             is_tx_closed,
@@ -361,6 +372,7 @@ impl StreamWorker {
 
     /// Sends data on the proxied stream in TCP to the destination.
     pub fn send(&mut self, payload: Vec<u8>) -> io::Result<()> {
+        let sender = self.tx_tx.as_ref().ok_or(io::ErrorKind::NotConnected)?;
         let size = payload.len();
         self.queued_bytes.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
             current.checked_add(size).filter(|&next| next <= MAX_TCP_PENDING_BYTES)
@@ -376,7 +388,7 @@ impl StreamWorker {
             bytes: payload,
             shared_bytes: Arc::clone(&self.global_queued_bytes),
         };
-        if self.tx_tx.send(queued).is_err() {
+        if sender.send(queued).is_err() {
             // The SendError owns `queued` and drops its shared-budget guard.
             self.queued_bytes.fetch_sub(size, Ordering::Relaxed);
             return Err(io::Error::from(io::ErrorKind::NotConnected));
@@ -388,9 +400,8 @@ impl StreamWorker {
     pub fn shutdown(&mut self, how: Shutdown) {
         match how {
             Shutdown::Write => {
-                if !self.is_tx_closed.load(Ordering::Relaxed) {
-                    let _ = self.tx_close_tx.try_send(());
-                }
+                // Closing the data channel lets the writer drain before sending EOF.
+                self.tx_tx.take();
             }
             Shutdown::Read => {
                 if !self.is_rx_closed.load(Ordering::Relaxed) {
@@ -407,7 +418,12 @@ impl StreamWorker {
     /// Closes the worker.
     pub fn close(&mut self) {
         self.cancelled.store(true, Ordering::Relaxed);
+        let _ = self.tx_close_tx.try_send(());
         self.shutdown(Shutdown::Both);
+    }
+
+    pub(crate) fn write_shutdown_requested(&self) -> bool {
+        self.tx_tx.is_none()
     }
 
     /// Returns if the worker is closed for writing.

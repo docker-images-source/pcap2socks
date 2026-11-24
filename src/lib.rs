@@ -24,7 +24,7 @@ pub mod stat;
 pub mod tcp;
 
 pub use self::proxy::ProxyConfig;
-use self::proxy::{DatagramWorker, ForwardDatagram, ForwardStream, StreamWorker, TcpTimeout};
+use self::proxy::{DatagramWorker, ForwardDatagram, ForwardStream, StreamWorker, TcpEvent, TcpWorkerEvent};
 use packet::layer::arp::Arp;
 use packet::layer::ethernet::Ethernet;
 use packet::layer::icmpv4::Icmpv4;
@@ -1238,8 +1238,8 @@ pub struct Redirector {
     states: HashMap<(SocketAddrV4, SocketAddrV4), TcpRxState>,
     stream_ids: HashMap<(SocketAddrV4, SocketAddrV4), u64>,
     next_stream_id: u64,
-    tcp_timeout_tx: mpsc::UnboundedSender<TcpTimeout>,
-    tcp_timeout_rx: mpsc::UnboundedReceiver<TcpTimeout>,
+    tcp_event_tx: mpsc::UnboundedSender<TcpEvent>,
+    tcp_event_rx: mpsc::UnboundedReceiver<TcpEvent>,
     tcp_ready_tx: mpsc::UnboundedSender<TcpReady>,
     tcp_ready_rx: mpsc::UnboundedReceiver<TcpReady>,
     pending_tcp: HashMap<(SocketAddrV4, SocketAddrV4), (u64, tokio::task::JoinHandle<()>)>,
@@ -1277,7 +1277,7 @@ impl Redirector {
             let forwarder = tx.lock().unwrap();
             (forwarder.local_ip_addr, forwarder.local_hardware_addr)
         };
-        let (tcp_timeout_tx, tcp_timeout_rx) = mpsc::unbounded_channel();
+        let (tcp_event_tx, tcp_event_rx) = mpsc::unbounded_channel();
         let (tcp_ready_tx, tcp_ready_rx) = mpsc::unbounded_channel();
         let (udp_ready_tx, udp_ready_rx) = mpsc::unbounded_channel();
         let redirector = Redirector {
@@ -1292,8 +1292,8 @@ impl Redirector {
             states: HashMap::new(),
             stream_ids: HashMap::new(),
             next_stream_id: 0,
-            tcp_timeout_tx,
-            tcp_timeout_rx,
+            tcp_event_tx,
+            tcp_event_rx,
             tcp_ready_tx,
             tcp_ready_rx,
             pending_tcp: HashMap::new(),
@@ -1360,13 +1360,7 @@ impl Redirector {
             }
             // Drop stale streams on the receiving task, which owns both state maps.
             // The pcap read timeout also wakes this loop on a quiet LAN.
-            while let Ok((src, dst, id)) = self.tcp_timeout_rx.try_recv() {
-                if self.stream_ids.get(&(src, dst)) == Some(&id) {
-                    debug!("clean up stalled TCP connection {} -> {}", src, dst);
-                    self.clean_up(src, dst);
-                }
-            }
-
+            self.poll_tcp_events();
             self.poll_connect_results();
             self.prune_abandoned_udp_associations();
 
@@ -1410,6 +1404,33 @@ impl Redirector {
         }
     }
 
+    fn poll_tcp_events(&mut self) {
+        while let Ok((src, dst, id, event)) = self.tcp_event_rx.try_recv() {
+            if self.stream_ids.get(&(src, dst)) != Some(&id) {
+                continue;
+            }
+            match event {
+                TcpWorkerEvent::WriteClosed => self.finish_tcp_if_closed(src, dst),
+                TcpWorkerEvent::Stalled => {
+                    debug!("clean up stalled TCP connection {} -> {}", src, dst);
+                    self.clean_up(src, dst);
+                }
+            }
+        }
+    }
+
+    fn finish_tcp_if_closed(&mut self, src: SocketAddrV4, dst: SocketAddrV4) {
+        // The last ACK and completion of the upstream write can arrive in either order.
+        let write_closed = self.streams.get(&(src, dst)).is_some_and(|stream| {
+            stream.write_shutdown_requested() && stream.is_tx_closed()
+        });
+        if write_closed && self.tx.lock().unwrap().get_state(dst, src)
+                .is_some_and(TcpTxState::fin_acknowledged)
+        {
+            self.clean_up(src, dst);
+        }
+    }
+
     /// Accept completed proxy handshakes on the task that owns TCP/UDP maps.
     fn poll_connect_results(&mut self) {
         while let Ok((src, dst, id, result)) = self.tcp_ready_rx.try_recv() {
@@ -1422,7 +1443,7 @@ impl Redirector {
                 Ok(stream) => {
                     let worker = StreamWorker::from_connected(
                         self.get_tx(), src, dst, stream,
-                        Some((self.tcp_timeout_tx.clone(), id)),
+                        Some((self.tcp_event_tx.clone(), id)),
                         Arc::clone(&self.tcp_queued_bytes),
                     );
                     match worker {
@@ -1665,13 +1686,9 @@ impl Redirector {
         let src = SocketAddrV4::new(tcp.src_ip_addr(), tcp.src());
         let dst = SocketAddrV4::new(tcp.dst_ip_addr(), tcp.dst());
         let key = (src, dst);
-        let is_exist = self.streams.get(&key).is_some();
-        let is_writable = match self.streams.get(&key) {
-            Some(stream) => !stream.is_tx_closed(),
-            None => false,
-        };
-
-        if is_exist {
+        if let Some(stream) = self.streams.get(&key) {
+            let write_shutdown = stream.write_shutdown_requested();
+            let is_writable = !stream.is_tx_closed();
             // ACK
             let state = self
                 .states
@@ -1698,7 +1715,12 @@ impl Redirector {
 
             if !payload.is_empty() {
                 // ACK
-                if is_writable {
+                if write_shutdown {
+                    // Re-ACK retransmitted final data without writing it twice.
+                    if !tcp.is_fin() {
+                        self.tx.lock().unwrap().send_tcp_ack_0(dst, src)?;
+                    }
+                } else if is_writable {
                     // Append to cache
                     let cont_payload = state.append_cache(tcp.sequence(), payload)?;
 
@@ -1782,48 +1804,37 @@ impl Redirector {
                     return Ok(());
                 }
             } else {
-                // ACK0
-                if !is_writable {
-                    if self.tx.lock().unwrap().get_cache_size(dst, src) == 0 {
-                        // LAST_ACK
-                        // Clean up
-                        self.clean_up(src, dst);
+                // Duplicate ACK
+                state.admit(tcp.acknowledgement());
+                if state.duplicate() >= DUPLICATES_THRESHOLD {
+                    let is_cooled_down = match state.last_retrans() {
+                        Some(instant) => instant.elapsed().as_millis() < RETRANS_COOL_DOWN,
+                        None => false,
+                    };
 
-                        return Ok(());
-                    }
-                } else {
-                    // Duplicate ACK
-                    state.admit(tcp.acknowledgement());
-                    if state.duplicate() >= DUPLICATES_THRESHOLD {
-                        let is_cooled_down = match state.last_retrans() {
-                            Some(instant) => instant.elapsed().as_millis() < RETRANS_COOL_DOWN,
-                            None => false,
-                        };
-
-                        if !is_cooled_down && !tcp.is_zero_window() {
-                            // Fast retransmit
-                            let mut is_sr = false;
-                            if state.sack_perm() {
-                                if let Some(sacks) = tcp.sack() {
-                                    if !sacks.is_empty() {
-                                        // Selective retransmission
-                                        self.tx.lock().unwrap().retransmit_tcp(
-                                            dst,
-                                            src,
-                                            Some(sacks),
-                                        )?;
-                                        is_sr = true;
-                                    }
+                    if !is_cooled_down && !tcp.is_zero_window() {
+                        // Fast retransmit
+                        let mut is_sr = false;
+                        if state.sack_perm() {
+                            if let Some(sacks) = tcp.sack() {
+                                if !sacks.is_empty() {
+                                    // Selective retransmission
+                                    self.tx.lock().unwrap().retransmit_tcp(
+                                        dst,
+                                        src,
+                                        Some(sacks),
+                                    )?;
+                                    is_sr = true;
                                 }
                             }
-
-                            if !is_sr {
-                                // Back N
-                                self.tx.lock().unwrap().retransmit_tcp(dst, src, None)?;
-                            }
-
-                            state.admit_retrans();
                         }
+
+                        if !is_sr {
+                            // Back N
+                            self.tx.lock().unwrap().retransmit_tcp(dst, src, None)?;
+                        }
+
+                        state.admit_retrans();
                     }
                 }
             }
@@ -1835,6 +1846,7 @@ impl Redirector {
             if tcp.is_fin() || state.fin_sequence().is_some() {
                 self.handle_tcp_fin(tcp, payload)?;
             }
+            self.finish_tcp_if_closed(src, dst);
         } else {
             // Send ACK/RST
             self.tx
@@ -1955,14 +1967,8 @@ impl Redirector {
         let src = SocketAddrV4::new(tcp.src_ip_addr(), tcp.src());
         let dst = SocketAddrV4::new(tcp.dst_ip_addr(), tcp.dst());
         let key = (src, dst);
-        let is_exist = self.streams.get(&key).is_some();
-        let (is_writable, is_readable) = match self.streams.get(&key) {
-            Some(stream) => (!stream.is_tx_closed(), !stream.is_rx_closed()),
-            None => (false, false),
-        };
-
-        if is_exist {
-            if is_writable {
+        if let Some(stream) = self.streams.get_mut(&key) {
+            if !stream.write_shutdown_requested() {
                 let state = self
                     .states
                     .get_mut(&key)
@@ -1981,29 +1987,14 @@ impl Redirector {
                         state.admit_fin();
                         state.add_recv_next(1);
 
-                        {
-                            let mut tx_locked = self.tx.lock().unwrap();
-                            let tx_state = tx_locked
-                                .get_state_mut(dst, src)
-                                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+                        stream.shutdown(Shutdown::Write);
 
-                            tx_state.add_acknowledgement(1);
-
-                            // Send ACK0
-                            tx_locked.send_tcp_ack_0(dst, src)?;
-                        }
-                        if is_readable {
-                            // Close by local
-                            let stream = self
-                                .streams
-                                .get_mut(&key)
-                                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-                            stream.shutdown(Shutdown::Write);
-                        } else {
-                            // Close by remote
-                            // Clean up
-                            self.clean_up(src, dst);
-                        }
+                        let mut tx_locked = self.tx.lock().unwrap();
+                        let tx_state = tx_locked
+                            .get_state_mut(dst, src)
+                            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+                        tx_state.add_acknowledgement(1);
+                        tx_locked.send_tcp_ack_0(dst, src)?;
                     } else {
                         trace!(
                             "TCP out of order of {} -> {} at {}",
@@ -2439,6 +2430,91 @@ mod tcp_control_packet_tests {
         ) -> Option<io::Result<()>> {
             self.0.lock().unwrap().push(packet.to_vec());
             Some(Ok(()))
+        }
+    }
+
+    async fn wait_for_fin(redirector: &Redirector, dst: SocketAddrV4, src: SocketAddrV4) {
+        while redirector.tx.lock().unwrap().get_state(dst, src).unwrap().cache_fin().is_none() {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn half_close_drains_writes_and_preserves_the_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let src = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000);
+        let dst = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443);
+        let ip = Ipv4::new(0, LayerKinds::Tcp, *src.ip(), *dst.ip()).unwrap();
+        let ack = |sequence, acknowledgement| {
+            let mut tcp = Tcp::new_ack(
+                src.port(), dst.port(), sequence, acknowledgement, 65535, None, None,
+            );
+            tcp.set_ipv4_layer(&ip);
+            tcp
+        };
+
+        for server_closes_first in [false, true] {
+            let listener = TcpListener::bind((*src.ip(), 0)).await.unwrap();
+            let socket = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (mut peer, _) = listener.accept().await.unwrap();
+            let tx = Forwarder::new(
+                Box::new(pcap::BlackHole::new()), 1500,
+                pcap::HARDWARE_ADDR_UNSPECIFIED, *src.ip(),
+            );
+            let mut redirector = Redirector::new(
+                Arc::new(Mutex::new(tx)), Ipv4Network::new(*src.ip(), 32).unwrap(),
+                *src.ip(), None, ProxyConfig::new_socks(dst, false, false, None), None,
+            );
+            redirector.tx.lock().unwrap().set_state(dst, src, TcpTxState::new(
+                src, dst, 1000, 301, 65535, None, false, None, 1460,
+            ));
+            redirector.states.insert((src, dst), TcpRxState::new(src, dst, 300, 0, 0, false));
+            let worker = StreamWorker::from_connected(
+                redirector.get_tx(), src, dst, socket, Some((redirector.tcp_event_tx.clone(), 1)),
+                Arc::clone(&redirector.tcp_queued_bytes),
+            ).unwrap();
+            redirector.stream_ids.insert((src, dst), 1);
+            redirector.streams.insert((src, dst), worker);
+            redirector.handle_tcp(&ack(301, 1001), &[]).await.unwrap();
+
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let response_ack = if server_closes_first {
+                    peer.shutdown().await.unwrap();
+                    wait_for_fin(&redirector, dst, src).await;
+                    1002
+                } else {
+                    1001
+                };
+
+                // A final ACK may arrive before the proxy writer has even run.
+                let mut fin = Tcp::new_ack_fin(src.port(), dst.port(), 301, response_ack, 65535, None);
+                fin.set_ipv4_layer(&ip);
+                redirector.handle_tcp(&fin, b"end").await.unwrap();
+                redirector.handle_tcp(&fin, b"end").await.unwrap();
+                let mut request = Vec::new();
+                peer.read_to_end(&mut request).await.unwrap();
+                assert_eq!(request, b"end");
+                redirector.poll_tcp_events();
+
+                if !server_closes_first {
+                    for (data, next_ack) in [(b"one", 1004), (b"two", 1007)] {
+                        peer.write_all(data).await.unwrap();
+                        while redirector.tx.lock().unwrap().get_cache_size(dst, src) == 0 {
+                            tokio::task::yield_now().await;
+                        }
+                        redirector.handle_tcp(&ack(305, next_ack), &[]).await.unwrap();
+                        assert!(redirector.streams.contains_key(&(src, dst)));
+                    }
+                    peer.shutdown().await.unwrap();
+                    wait_for_fin(&redirector, dst, src).await;
+                    redirector.handle_tcp(&ack(305, 1008), &[]).await.unwrap();
+                }
+                assert!(!redirector.streams.contains_key(&(src, dst)));
+                assert!(!redirector.states.contains_key(&(src, dst)));
+                assert!(redirector.tx.lock().unwrap().get_state(dst, src).is_none());
+            }).await.unwrap();
         }
     }
 
