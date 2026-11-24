@@ -547,7 +547,7 @@ impl Forwarder {
                 let payload = state.append_cache(size)?;
 
                 // If the queue is empty and a FIN is in the queue, pop it
-                if state.queue().is_empty() && state.queue_fin() {
+                if state.queue().is_empty() && state.queue_fin() && state.cache().len() < state.src_window() {
                     // ACK/FIN
                     state.append_cache_fin();
 
@@ -568,20 +568,15 @@ impl Forwarder {
             }
         }
 
-        // If the queue is empty and a FIN is in the queue, pop it
-        // FIN
+        // FIN consumes one byte of the peer's window after all queued data.
         let state = self
             .get_state_mut(dst, src)
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-        #[allow(clippy::collapsible_if)]
-        if state.queue_fin() {
-            if state.cache().is_empty() {
-                // FIN
-                state.append_cache_fin();
-
-                // Send
-                self.send_tcp_fin(dst, src)?;
-            }
+        if state.queue_fin() && state.queue().is_empty()
+            && state.cache().is_empty() && state.src_window() > 0
+        {
+            state.append_cache_fin();
+            self.send_tcp_fin(dst, src)?;
         }
 
         Ok(())
@@ -816,17 +811,25 @@ impl Forwarder {
         let state = self
             .get_state(dst, src)
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        let fin_sequence = state.cache().recv_next();
         let tcp = Tcp::new_fin(
             dst.port(),
             src.port(),
-            state.sequence(),
+            fin_sequence,
             state.acknowledgement(),
             self.get_tcp_window(dst, src),
             None,
         );
 
         // Send
-        self.send_ipv4(*dst.ip(), *src.ip(), Layers::Tcp(tcp), None)
+        self.send_ipv4(*dst.ip(), *src.ip(), Layers::Tcp(tcp), None)?;
+
+        // A retransmitted FIN uses the same sequence as its first transmission.
+        let state = self.get_state_mut(dst, src).unwrap();
+        if state.sequence() == fin_sequence {
+            state.add_sequence(1);
+        }
+        Ok(())
     }
 
     /// Sends UDP packets.
@@ -2404,7 +2407,7 @@ mod tcp_rst_validation_tests {
 }
 
 #[cfg(test)]
-mod tcp_connect_failure_tests {
+mod tcp_control_packet_tests {
     use super::*;
     use pnet::datalink::{DataLinkSender, NetworkInterface};
     use pnet::packet::ethernet::EthernetPacket;
@@ -2436,6 +2439,51 @@ mod tcp_connect_failure_tests {
         ) -> Option<io::Result<()>> {
             self.0.lock().unwrap().push(packet.to_vec());
             Some(Ok(()))
+        }
+    }
+
+    #[test]
+    fn fin_follows_data_and_consumes_one_sequence_number() {
+        let src = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000);
+        let dst = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443);
+        for window in [3, 4] {
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let mut tx = Forwarder::new(
+                Box::new(RecordingSender(Arc::clone(&frames))), 1500,
+                pcap::HARDWARE_ADDR_UNSPECIFIED, Ipv4Addr::LOCALHOST,
+            );
+            tx.set_state(dst, src, TcpTxState::new(
+                src, dst, u32::MAX - 2, 0, 0, None, false, None, 1460,
+            ));
+
+            tx.queue_tcp(dst, src, b"end").unwrap();
+            tx.close(dst, src).unwrap();
+            assert!(frames.lock().unwrap().is_empty());
+
+            tx.get_state_mut(dst, src).unwrap().set_src_window(window);
+            tx.send_tcp(dst, src).unwrap();
+            if window == 3 {
+                // Only the payload fit. A cumulative ACK frees room for FIN.
+                tx.get_state_mut(dst, src).unwrap().acknowledge(0);
+                tx.send_tcp(dst, src).unwrap();
+            }
+            assert_eq!(tx.get_state(dst, src).unwrap().sequence(), 1);
+            tx.send_tcp_fin(dst, src).unwrap();
+            let frames = frames.lock().unwrap();
+            let packets: Vec<_> = frames.iter().map(|frame| {
+                let indicator = Indicator::from(frame).unwrap();
+                let tcp = indicator.tcp().unwrap();
+                (tcp.sequence(), tcp.is_fin())
+            }).collect();
+            if window == 3 {
+                assert_eq!(packets, [(u32::MAX - 2, false), (0, true), (0, true)]);
+            } else {
+                assert_eq!(packets, [(u32::MAX - 2, true), (0, true)]);
+            }
+            let state = tx.get_state_mut(dst, src).unwrap();
+            state.acknowledge(1);
+            assert!(state.cache_fin().is_none());
+            assert_eq!(state.sequence(), 1);
         }
     }
 

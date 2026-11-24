@@ -769,9 +769,6 @@ impl TcpTxState {
                 self.cache_fin_retrans = false;
                 progressed = true;
                 trace!("acknowledge TCP FIN of {} -> {}", self.dst, self.src);
-
-                // Update TCP sequence
-                self.add_sequence(1);
             }
         }
 
