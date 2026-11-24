@@ -1483,8 +1483,8 @@ impl Redirector {
         warn!("SOCKS TCP connect {} -> {} failed: {}", src, dst, error);
         let reset = {
             let mut forwarder = self.tx.lock().unwrap();
-            if let Some(state) = forwarder.get_state_mut(dst, src) {
-                state.add_acknowledgement(1);
+            // SYN has already advanced the acknowledgement by one.
+            if forwarder.get_state(dst, src).is_some() {
                 forwarder.send_tcp_ack_rst(dst, src)
             } else {
                 Ok(())
@@ -2400,6 +2400,89 @@ mod tcp_rst_validation_tests {
 
         redirector.handle_tcp_rst(&rst_packet(src, dst, 0));
         assert!(!redirector.states.contains_key(&(src, dst)));
+    }
+}
+
+#[cfg(test)]
+mod tcp_connect_failure_tests {
+    use super::*;
+    use pnet::datalink::{DataLinkSender, NetworkInterface};
+    use pnet::packet::ethernet::EthernetPacket;
+    use pnet::packet::ipv4::Ipv4Packet;
+    use pnet::packet::tcp::{TcpFlags, TcpPacket};
+    use pnet::packet::Packet;
+
+    struct RecordingSender(Arc<Mutex<Vec<Vec<u8>>>>);
+
+    impl DataLinkSender for RecordingSender {
+        fn build_and_send(
+            &mut self,
+            num_packets: usize,
+            packet_size: usize,
+            func: &mut dyn FnMut(&mut [u8]),
+        ) -> Option<io::Result<()>> {
+            for _ in 0..num_packets {
+                let mut packet = vec![0; packet_size];
+                func(&mut packet);
+                self.0.lock().unwrap().push(packet);
+            }
+            Some(Ok(()))
+        }
+
+        fn send_to(
+            &mut self,
+            packet: &[u8],
+            _: Option<NetworkInterface>,
+        ) -> Option<io::Result<()>> {
+            self.0.lock().unwrap().push(packet.to_vec());
+            Some(Ok(()))
+        }
+    }
+
+    #[test]
+    fn failed_socks_connect_resets_syn_with_correct_ack() {
+        let host = Ipv4Addr::new(192, 0, 2, 250);
+        let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 40000);
+        let dst = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 443);
+
+        for syn_sequence in [12345, u32::MAX] {
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let forwarder = Forwarder::new(
+                Box::new(RecordingSender(Arc::clone(&frames))),
+                1500,
+                pcap::HARDWARE_ADDR_UNSPECIFIED,
+                host,
+            );
+            let mut redirector = Redirector::new(
+                Arc::new(Mutex::new(forwarder)),
+                Ipv4Network::new(*src.ip(), 32).unwrap(),
+                host,
+                None,
+                ProxyConfig::new_socks(SocketAddrV4::new(host, 1083), false, false, None),
+                None,
+            );
+            let acknowledgement = syn_sequence.wrapping_add(1);
+            redirector.tx.lock().unwrap().set_state(
+                dst,
+                src,
+                TcpTxState::new(src, dst, 42, acknowledgement, 65535, None, false, None, 1460),
+            );
+
+            redirector.fail_tcp_connect(
+                src,
+                dst,
+                io::Error::from(io::ErrorKind::ConnectionRefused),
+            );
+
+            let frames = frames.lock().unwrap();
+            assert_eq!(frames.len(), 1);
+            let ethernet = EthernetPacket::new(&frames[0]).unwrap();
+            let ipv4 = Ipv4Packet::new(ethernet.payload()).unwrap();
+            let tcp = TcpPacket::new(ipv4.payload()).unwrap();
+            assert_eq!(tcp.get_flags(), TcpFlags::RST | TcpFlags::ACK);
+            assert_eq!(tcp.get_acknowledgement(), acknowledgement);
+            assert!(redirector.tx.lock().unwrap().get_state(dst, src).is_none());
+        }
     }
 }
 
