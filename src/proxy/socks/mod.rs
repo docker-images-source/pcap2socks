@@ -5,7 +5,7 @@ use log::trace;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{self, BufStream};
+use tokio::io::{self, BufStream, BufWriter};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time;
 
@@ -65,10 +65,11 @@ pub async fn connect(
     remote: SocketAddrV4,
     dst: SocketAddrV4,
     options: &SocksOption,
-) -> io::Result<BufStream<TcpStream>> {
+) -> io::Result<TcpStream> {
     let stream = time::timeout(CONNECT_TIMEOUT, TcpStream::connect(remote))
         .await.map_err(|_| connect_timeout())??;
-    let mut stream = BufStream::new(stream);
+    // Buffer the small handshake writes without reading ahead into application data.
+    let mut stream = BufWriter::new(stream);
     let result = time::timeout(CONNECT_TIMEOUT, async_socks5::connect(&mut stream, dst, options.auth()))
         .await.map_err(|_| connect_timeout())?;
     if let Err(e) = result {
@@ -78,7 +79,7 @@ pub async fn connect(
         }
     }
 
-    Ok(stream)
+    Ok(stream.into_inner())
 }
 
 const RSV_SIZE: usize = 2;
@@ -197,6 +198,35 @@ impl SocksRecvHalf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connect_preserves_data_following_the_reply() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let proxy = SocketAddrV4::new(Ipv4Addr::LOCALHOST, listener.local_addr().unwrap().port());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            socket.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            socket.write_all(&[5, 0]).await.unwrap();
+
+            let mut request = [0; 10];
+            socket.read_exact(&mut request).await.unwrap();
+            let mut reply = vec![5, 0, 0, 1, 127, 0, 0, 1, 0, 25];
+            reply.extend_from_slice(b"220 ready\r\n");
+            socket.write_all(&reply).await.unwrap();
+        });
+
+        let options = SocksOption::new(false, false, None);
+        let mut stream = connect(proxy, proxy, &options).await.unwrap();
+        let mut banner = Vec::new();
+        stream.read_to_end(&mut banner).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(banner, b"220 ready\r\n");
+    }
 
     #[test]
     fn parse_udp_source_validates_header() {

@@ -28,7 +28,7 @@ impl ProxyConfig {
     pub(crate) async fn connect_tcp(&self, dst: SocketAddrV4) -> io::Result<tokio::net::TcpStream> {
         match self {
             ProxyConfig::Socks(remote, options) =>
-                Ok(socks::connect(*remote, dst, options).await?.into_inner()),
+                socks::connect(*remote, dst, options).await,
         }
     }
 
@@ -449,12 +449,7 @@ impl StreamWorker2 {
     ) -> io::Result<StreamWorker2> {
         let tx_cloned = Arc::clone(&tx);
 
-        let stream = match proxy {
-            ProxyConfig::Socks(remote, options) => {
-                socks::connect(*remote, dst, options).await?
-            }
-        };
-        let stream = stream.into_inner();
+        let stream = proxy.connect_tcp(dst).await?;
         let (mut stream_rx, stream_tx) = stream.into_split();
 
         // Open
