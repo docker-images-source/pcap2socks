@@ -273,6 +273,31 @@ struct Flags {
     pub password: Option<String>,
 }
 
+#[cfg(unix)]
+fn local_timestamp() -> Option<String> {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).ok()?;
+    let seconds = libc::time_t::try_from(elapsed.as_secs()).ok()?;
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: Both pointers are valid and localtime_r initializes the result
+    // on success. Its caller-owned buffer avoids the shared localtime buffer.
+    let local = unsafe {
+        if libc::localtime_r(&seconds, local.as_mut_ptr()).is_null() {
+            return None;
+        }
+        local.assume_init()
+    };
+    let offset_minutes = local.tm_gmtoff.unsigned_abs() / 60;
+
+    Some(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}{}{:02}:{:02}",
+        local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,
+        local.tm_hour, local.tm_min, local.tm_sec, elapsed.subsec_millis(),
+        if local.tm_gmtoff < 0 { '-' } else { '+' },
+        offset_minutes / 60, offset_minutes % 60,
+    ))
+}
+
 /// Represents a logger.
 struct Logger {
     stderr_logger: env_logger::Logger,
@@ -292,7 +317,11 @@ impl Logger {
                 Level::Debug => style.set_color(Color::Rgb(165, 165, 165)).value("DEBUG"),
                 Level::Trace => style.set_color(Color::Rgb(165, 165, 165)).value("TRACE"),
             };
-            writeln!(buf, "[{}] {} {}", buf.timestamp_millis(), level, record.args())
+            #[cfg(unix)]
+            let timestamp = local_timestamp().unwrap_or_else(|| buf.timestamp_millis().to_string());
+            #[cfg(not(unix))]
+            let timestamp = buf.timestamp_millis();
+            writeln!(buf, "[{}] {} {}", timestamp, level, record.args())
         };
 
         let stderr_logger = env_logger::builder()

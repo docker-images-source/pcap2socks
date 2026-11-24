@@ -405,6 +405,7 @@ dependencies = [
  "env_logger",
  "interfaces",
  "ipnetwork 0.21.1",
+ "libc",
  "log",
  "lru",
  "netifs",

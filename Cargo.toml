@@ -30,3 +30,6 @@ netifs = { git = "https://github.com/zhxie/netifs-rs" }
 
 [target.'cfg(not(windows))'.dependencies]
 interfaces = "0.0.9"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.180"
