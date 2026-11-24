@@ -32,6 +32,13 @@ pcap2socks -s <ADDRESS>
 pcap2socks -s <ADDRESS> -p <ADDRESS> -d <ADDRESS>
 ```
 
+Set the client gateway to the published address (or the selected interface's
+address when `--publish` is omitted). Only IPv4 frames addressed to that
+interface's MAC are redirected. Direct traffic sent to another router remains
+direct even when promiscuous capture can see it. If the SOCKS proxy runs on a
+proxied client, route its upstream traffic through another gateway to avoid a
+proxy loop.
+
 ### Flags
 
 `-h, --help`: Prints help information.

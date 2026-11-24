@@ -1228,6 +1228,7 @@ pub struct Redirector {
     src_ip_addr: Ipv4Network,
     local_ip_addr: Ipv4Addr,
     interface_ip_addr: Ipv4Addr,
+    interface_hardware_addr: HardwareAddr,
     gw_ip_addr: Option<Ipv4Addr>,
     proxy: ProxyConfig,
     streams: HashMap<(SocketAddrV4, SocketAddrV4), StreamWorker>,
@@ -1268,8 +1269,11 @@ impl Redirector {
     ) -> Redirector {
         let size = traffic.as_ref().map(|traffic| traffic.size());
         let count = traffic.as_ref().map(|traffic| traffic.count());
-        // Snapshot the actual interface IP before the virtual gateway overrides it.
-        let interface_ip_addr = tx.lock().unwrap().local_ip_addr;
+        // Snapshot the interface addresses before the virtual gateway overrides its IP.
+        let (interface_ip_addr, interface_hardware_addr) = {
+            let forwarder = tx.lock().unwrap();
+            (forwarder.local_ip_addr, forwarder.local_hardware_addr)
+        };
         let (tcp_timeout_tx, tcp_timeout_rx) = mpsc::unbounded_channel();
         let (tcp_ready_tx, tcp_ready_rx) = mpsc::unbounded_channel();
         let (udp_ready_tx, udp_ready_rx) = mpsc::unbounded_channel();
@@ -1278,6 +1282,7 @@ impl Redirector {
             src_ip_addr,
             local_ip_addr,
             interface_ip_addr,
+            interface_hardware_addr,
             gw_ip_addr,
             proxy,
             streams: HashMap::new(),
@@ -1527,6 +1532,14 @@ impl Redirector {
     }
 
     async fn handle_ipv4(&mut self, indicator: &Indicator, frame: &[u8]) -> io::Result<()> {
+        // Promiscuous capture also sees direct traffic sent to other routers.
+        // Redirect only frames addressed to this gateway, before learning MACs
+        // or reassembling fragments, or proxy egress can recurse through SOCKS.
+        if indicator.ethernet().map(|ethernet| ethernet.dst())
+            != Some(self.interface_hardware_addr)
+        {
+            return Ok(());
+        }
         if let Some(ipv4) = indicator.ipv4() {
             let src = ipv4.src();
             if self.should_proxy_ipv4(src, ipv4.dst()) {
@@ -2122,6 +2135,141 @@ impl Redirector {
     fn set_tx_hardware_addr(&mut self, ip_addr: Ipv4Addr, hardware_addr: HardwareAddr) {
         if self.tx.lock().unwrap().set_src_hardware_addr(ip_addr, hardware_addr) {
             info!("Device {} ({}) joined or updated its address", ip_addr, hardware_addr);
+        }
+    }
+}
+
+#[cfg(test)]
+mod ethernet_destination_tests {
+    use super::*;
+    use pnet::util::MacAddr;
+
+    const HOST_MAC: HardwareAddr = MacAddr(2, 0, 0, 0, 0, 10);
+    const ROUTER_MAC: HardwareAddr = MacAddr(2, 0, 0, 0, 0, 1);
+    const CLIENT_MAC: HardwareAddr = MacAddr(2, 0, 0, 0, 0, 101);
+    const CLIENT: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 101);
+
+    fn redirector() -> Redirector {
+        let host = Ipv4Addr::new(192, 168, 1, 10);
+        let gateway = Ipv4Addr::new(192, 168, 1, 250);
+        let forwarder = Forwarder::new(Box::new(pcap::BlackHole::new()), 1500, HOST_MAC, host);
+        Redirector::new(
+            Arc::new(Mutex::new(forwarder)),
+            Ipv4Network::new(CLIENT, 32).unwrap(),
+            gateway,
+            Some(gateway),
+            ProxyConfig::new_socks(SocketAddrV4::new(host, 1083), false, false, None),
+            None,
+        )
+    }
+
+    fn frame(mac: HardwareAddr, ipv4: Ipv4, transport: Option<Layers>, payload: &[u8]) -> Vec<u8> {
+        let indicator = Indicator::new(
+            Layers::Ethernet(Ethernet::new(LayerKinds::Ipv4, CLIENT_MAC, mac).unwrap()),
+            Some(Layers::Ipv4(ipv4)),
+            transport,
+        );
+        let mut frame = vec![0; indicator.len() + payload.len()];
+        indicator
+            .serialize_with_payload(&mut frame, payload)
+            .unwrap();
+        frame
+    }
+
+    async fn deliver(redirector: &mut Redirector, frame: &[u8]) {
+        let indicator = Indicator::from(frame).unwrap();
+        redirector.handle_ipv4(&indicator, frame).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_tcp_egress_does_not_consume_proxy_slots() {
+        let mut redirector = redirector();
+        let dst = Ipv4Addr::new(10, 3, 1, 1);
+        // A valid TCP SYN, targeting the upstream endpoint seen in the logs.
+        let mut syn = [0u8; 20];
+        syn[2..4].copy_from_slice(&1776u16.to_be_bytes());
+        syn[12] = 0x50;
+        syn[13] = 0x02;
+        syn[14..16].copy_from_slice(&65535u16.to_be_bytes());
+        for port in 40000u16..40300 {
+            syn[..2].copy_from_slice(&port.to_be_bytes());
+            let ipv4 = Ipv4::new(0, LayerKinds::Tcp, CLIENT, dst).unwrap();
+            deliver(&mut redirector, &frame(ROUTER_MAC, ipv4, None, &syn)).await;
+        }
+        assert!(redirector.pending_tcp.is_empty());
+        assert!(redirector.states.is_empty());
+        assert!(
+            redirector
+                .tx
+                .lock()
+                .unwrap()
+                .src_hardware_addr_map
+                .is_empty()
+        );
+
+        // The same IP destination still proxies when routed through our MAC.
+        let ipv4 = Ipv4::new(0, LayerKinds::Tcp, CLIENT, dst).unwrap();
+        deliver(&mut redirector, &frame(HOST_MAC, ipv4, None, &syn)).await;
+        let src = SocketAddrV4::new(CLIENT, 40299);
+        let dst = SocketAddrV4::new(dst, 1776);
+        assert!(redirector.pending_tcp.contains_key(&(src, dst)));
+        assert!(redirector.states.contains_key(&(src, dst)));
+        redirector.clean_up(src, dst);
+    }
+
+    #[tokio::test]
+    async fn only_gateway_addressed_udp_creates_an_association() {
+        let mut redirector = redirector();
+        let ipv4 = Ipv4::new(0, LayerKinds::Udp, CLIENT, Ipv4Addr::new(8, 8, 8, 8)).unwrap();
+        let udp = Udp::new(40000, 53);
+        for mac in [ROUTER_MAC, pcap::HARDWARE_ADDR_BROADCAST] {
+            deliver(
+                &mut redirector,
+                &frame(mac, ipv4.clone(), Some(Layers::Udp(udp.clone())), b"dns"),
+            )
+            .await;
+        }
+        assert!(redirector.pending_udp.is_empty());
+        assert!(
+            redirector
+                .tx
+                .lock()
+                .unwrap()
+                .src_hardware_addr_map
+                .is_empty()
+        );
+
+        deliver(
+            &mut redirector,
+            &frame(HOST_MAC, ipv4, Some(Layers::Udp(udp)), b"dns"),
+        )
+        .await;
+        assert_eq!(redirector.pending_udp.len(), 1);
+        for (_, pending) in redirector.pending_udp.drain() {
+            pending.task.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_fragments_do_not_enter_gateway_reassembly() {
+        let mut redirector = redirector();
+        let dst = Ipv4Addr::new(8, 8, 8, 8);
+        let first = Ipv4::new_more_fragment(42, LayerKinds::Udp, 0, CLIENT, dst).unwrap();
+        let last = Ipv4::new_last_fragment(42, LayerKinds::Udp, 1, CLIENT, dst).unwrap();
+        let udp = [0x9c, 0x40, 0, 53, 0, 16, 0, 0];
+
+        deliver(
+            &mut redirector,
+            &frame(ROUTER_MAC, first.clone(), None, &udp),
+        )
+        .await;
+        deliver(&mut redirector, &frame(HOST_MAC, last, None, b"12345678")).await;
+        assert!(redirector.pending_udp.is_empty());
+
+        deliver(&mut redirector, &frame(HOST_MAC, first, None, &udp)).await;
+        assert_eq!(redirector.pending_udp.len(), 1);
+        for (_, pending) in redirector.pending_udp.drain() {
+            pending.task.abort();
         }
     }
 }
