@@ -1411,6 +1411,13 @@ impl Redirector {
             }
             match event {
                 TcpWorkerEvent::WriteClosed => self.finish_tcp_if_closed(src, dst),
+                TcpWorkerEvent::WriteFailed => {
+                    let reset = self.tx.lock().unwrap().send_tcp_ack_rst(dst, src);
+                    if let Err(e) = reset {
+                        warn!("send TCP reset after proxy write failure: {}", e);
+                    }
+                    self.clean_up(src, dst);
+                }
                 TcpWorkerEvent::Stalled => {
                     debug!("clean up stalled TCP connection {} -> {}", src, dst);
                     self.clean_up(src, dst);
@@ -2431,6 +2438,50 @@ mod tcp_control_packet_tests {
             self.0.lock().unwrap().push(packet.to_vec());
             Some(Ok(()))
         }
+    }
+
+    #[test]
+    fn failed_proxy_write_resets_and_releases_current_connection() {
+        let host = Ipv4Addr::new(192, 0, 2, 250);
+        let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 40000);
+        let dst = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 443);
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let forwarder = Forwarder::new(
+            Box::new(RecordingSender(Arc::clone(&frames))), 1500,
+            pcap::HARDWARE_ADDR_UNSPECIFIED, host,
+        );
+        let mut redirector = Redirector::new(
+            Arc::new(Mutex::new(forwarder)), Ipv4Network::new(*src.ip(), 32).unwrap(),
+            host, None, ProxyConfig::new_socks(SocketAddrV4::new(host, 1083), false, false, None),
+            None,
+        );
+        redirector.tx.lock().unwrap().set_state(dst, src, TcpTxState::new(
+            src, dst, 42, 301, 65535, None, false, None, 1460,
+        ));
+        let key = (src, dst);
+        redirector.states.insert(key, TcpRxState::new(src, dst, 300, 0, 0, false));
+        redirector.stream_ids.insert(key, 2);
+
+        // A failed writer from an earlier generation must not reset this stream.
+        assert!(redirector.tcp_event_tx.send((src, dst, 1, TcpWorkerEvent::WriteFailed)).is_ok());
+        redirector.poll_tcp_events();
+        assert_eq!(redirector.stream_ids.get(&key), Some(&2));
+        assert!(frames.lock().unwrap().is_empty());
+
+        assert!(redirector.tcp_event_tx.send((src, dst, 2, TcpWorkerEvent::WriteFailed)).is_ok());
+        redirector.poll_tcp_events();
+        assert!(!redirector.stream_ids.contains_key(&key));
+        assert!(!redirector.states.contains_key(&key));
+        assert!(redirector.tx.lock().unwrap().get_state(dst, src).is_none());
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 1);
+        let ethernet = EthernetPacket::new(&frames[0]).unwrap();
+        let ipv4 = Ipv4Packet::new(ethernet.payload()).unwrap();
+        let tcp = TcpPacket::new(ipv4.payload()).unwrap();
+        assert_eq!(tcp.get_flags(), TcpFlags::RST | TcpFlags::ACK);
+        assert_eq!(tcp.get_sequence(), 42);
+        assert_eq!(tcp.get_acknowledgement(), 301);
     }
 
     async fn wait_for_fin(redirector: &Redirector, dst: SocketAddrV4, src: SocketAddrV4) {

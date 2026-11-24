@@ -16,6 +16,7 @@ use socks::{SocksAuth, SocksOption};
 
 pub(crate) enum TcpWorkerEvent {
     WriteClosed,
+    WriteFailed,
     Stalled,
 }
 
@@ -177,19 +178,19 @@ impl StreamWorker {
 
         // Send: cancellation remains selectable even while writing to a dead proxy.
         tokio::spawn(async move {
-            loop {
+            let event = loop {
                 let payload = tokio::select! {
                     biased;
-                    _ = tx_close_rx.recv() => break,
+                    _ = tx_close_rx.recv() => break TcpWorkerEvent::WriteClosed,
                     value = tx_rx.recv() => match value {
                         Some(payload) => payload,
-                        None => break,
+                        None => break TcpWorkerEvent::WriteClosed,
                     },
                 };
                 queued_bytes_tx.fetch_sub(payload.bytes.len(), Ordering::Relaxed);
                 let result = tokio::select! {
                     biased;
-                    _ = tx_close_rx.recv() => break,
+                    _ = tx_close_rx.recv() => break TcpWorkerEvent::WriteClosed,
                     result = time::timeout(Duration::from_secs(60),
                         stream_tx.write_all(payload.bytes.as_slice())) => result,
                 };
@@ -200,18 +201,18 @@ impl StreamWorker {
                     ),
                     Ok(Err(e)) => {
                         warn!("handle send: TCP: {} -> {}: {}", src, dst, e);
-                        break;
+                        break TcpWorkerEvent::WriteFailed;
                     }
                     Err(_) => {
                         warn!("SOCKS5 TCP write stalled: {}", dst);
-                        break;
+                        break TcpWorkerEvent::WriteFailed;
                     }
                 }
-            }
+            };
             drop(stream_tx);
             is_tx_closed_cloned.store(true, Ordering::Relaxed);
             if let Some((sender, id)) = writer_events {
-                let _ = sender.send((src, dst, id, TcpWorkerEvent::WriteClosed));
+                let _ = sender.send((src, dst, id, event));
             }
             debug!("close stream TX {} -> {}", src, dst);
         });
