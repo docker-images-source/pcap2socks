@@ -280,45 +280,18 @@ impl Queue {
     /// Returns the payload which is timed out from the begin to the first byte which is not timed out
     /// and update their timeout timer.
     pub fn get_timed_out_and_update(&mut self, rto: u64) -> Vec<u8> {
-        let mut recv_next = None;
-        for clock in &self.clocks {
-            let timer = clock.1;
-            if !timer.is_timedout() {
-                recv_next = Some(clock.0);
-                break;
-            }
+        let expired = self.clocks.iter().take_while(|(_, timer)| timer.is_timedout()).count();
+        if expired == 0 {
+            return Vec::new();
         }
 
-        match recv_next {
-            Some(recv_next) => {
-                let size = recv_next.wrapping_sub(self.sequence) as usize;
-
-                // Update clock
-                while !self.clocks.is_empty() {
-                    let next_sequence = self.clocks.front().unwrap().0;
-                    if recv_next.wrapping_sub(next_sequence) as usize
-                        <= MAX_U32_WINDOW_SIZE
-                    {
-                        self.clocks.pop_front();
-                    } else {
-                        self.clocks.push_front((self.sequence, Timer::new(rto)));
-
-                        break;
-                    }
-                }
-                self.retrans = Some(recv_next);
-
-                self.get(self.sequence, size).unwrap()
-            }
-            None => {
-                // Update clock
-                self.clocks.clear();
-                self.clocks.push_back((self.sequence, Timer::new(rto)));
-                self.retrans = Some(self.recv_next());
-
-                self.get_all()
-            }
-        }
+        let end = self.clocks.get(expired)
+            .map_or_else(|| self.recv_next(), |&(sequence, _)| sequence);
+        let size = end.wrapping_sub(self.sequence) as usize;
+        self.clocks.drain(..expired);
+        self.clocks.push_front((self.sequence, Timer::new(rto)));
+        self.retrans = Some(end);
+        self.get(self.sequence, size).unwrap()
     }
 
     /// Returns the capacity of the queue.
@@ -385,6 +358,24 @@ impl Display for Queue {
         }
         write!(f, "]")
     }
+}
+
+#[test]
+fn retransmission_keeps_the_first_unexpired_timer() {
+    let mut queue = Queue::with_capacity(8, u32::MAX);
+    queue.append(b"ab", 1000).unwrap();
+    queue.append(b"cd", 1000).unwrap();
+    let clocks = queue.clocks.clone();
+    assert!(queue.get_timed_out_and_update(2000).is_empty());
+    assert_eq!(queue.clocks, clocks);
+
+    queue.clocks[0].1.instant -= Duration::from_secs(2);
+    assert_eq!(queue.get_timed_out_and_update(2000), b"ab");
+    assert_eq!(queue.clocks[1], clocks[1]);
+    queue.invalidate_to(1);
+    queue.clocks[0].1.instant -= Duration::from_secs(2);
+    assert_eq!(queue.get_timed_out_and_update(2000), b"cd");
+    assert!(queue.get_timed_out_and_update(4000).is_empty());
 }
 
 #[test]
