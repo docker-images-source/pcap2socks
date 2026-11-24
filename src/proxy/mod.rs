@@ -202,7 +202,7 @@ impl StreamWorker {
                 }
             }
             is_tx_closed_cloned.store(true, Ordering::Relaxed);
-            trace!("close stream TX {} -> {}", src, dst);
+            debug!("close stream TX {} -> {}", src, dst);
         });
 
         // Receive
@@ -301,7 +301,7 @@ impl StreamWorker {
                 } else {
                     // Close
                     is_rx_closed_cloned.store(true, Ordering::Relaxed);
-                    trace!("close stream RX {} -> {}", dst, src);
+                    debug!("close stream RX {} -> {}", dst, src);
 
                     let mut forwarder = tx.lock().unwrap();
                     if !cancelled_rx.load(Ordering::Relaxed) {
@@ -343,7 +343,7 @@ impl StreamWorker {
             }
         });
 
-        trace!("open stream {} -> {}", src, dst);
+        debug!("open stream {} -> {}", src, dst);
 
         Ok(StreamWorker {
             src,
@@ -424,7 +424,7 @@ impl StreamWorker {
 impl Drop for StreamWorker {
     fn drop(&mut self) {
         self.close();
-        trace!("drop stream {} -> {}", self.src, self.dst);
+        debug!("drop stream {} -> {}", self.src, self.dst);
     }
 }
 
@@ -519,7 +519,7 @@ impl StreamWorker2 {
                 } else {
                     // Close
                     is_rx_closed_cloned.store(true, Ordering::Relaxed);
-                    trace!("close stream RX {} -> {}", dst, src);
+                    debug!("close stream RX {} -> {}", dst, src);
 
                     if let Err(ref e) = tx.lock().unwrap().close(dst, src) {
                         warn!("handle close: {}: {} -> {}: {}", "TCP", dst, src, e);
@@ -544,7 +544,7 @@ impl StreamWorker2 {
             }
         });
 
-        trace!("open stream {} -> {}", src, dst);
+        debug!("open stream {} -> {}", src, dst);
 
         Ok(StreamWorker2 {
             src,
@@ -581,7 +581,7 @@ impl StreamWorker2 {
                 if !self.is_tx_closed.load(Ordering::Relaxed) {
                     self.is_tx_closed.store(true, Ordering::Relaxed);
                     self.stream_tx.take().unwrap().forget();
-                    trace!("close stream TX {} -> {}", self.src, self.dst);
+                    debug!("close stream TX {} -> {}", self.src, self.dst);
                 }
             }
             Shutdown::Read => {
@@ -615,7 +615,7 @@ impl StreamWorker2 {
 impl Drop for StreamWorker2 {
     fn drop(&mut self) {
         self.close();
-        trace!("drop stream {} -> {}", self.src, self.dst);
+        debug!("drop stream {} -> {}", self.src, self.dst);
     }
 }
 
@@ -777,7 +777,7 @@ impl DatagramWorker {
                 } else if closed {
                     is_closed_cloned.store(true, Ordering::Relaxed);
                     let _ = close_sender.try_send(());
-                    trace!(
+                    debug!(
                         "close datagram {} = {}",
                         local_port,
                         u64_to_socket_addr_v4(a_src_cloned.load(Ordering::Relaxed))
@@ -788,7 +788,7 @@ impl DatagramWorker {
             }
         });
 
-        trace!("create datagram {} = {}", src, local_port);
+        debug!("create datagram {} = {}", src, local_port);
 
         Ok((
             DatagramWorker {
@@ -829,7 +829,7 @@ impl DatagramWorker {
     pub fn set_src(&mut self, src: &SocketAddrV4) {
         self.src
             .store(socket_addr_v4_to_u64(src), Ordering::Relaxed);
-        trace!("set datagram {} = {}", src, self.local_port);
+        debug!("set datagram {} = {}", src, self.local_port);
     }
 
     /// Returns the source of the worker.
@@ -847,7 +847,7 @@ impl Drop for DatagramWorker {
     fn drop(&mut self) {
         let _ = self.close_tx.try_send(());
         let _ = self.close_tx2.try_send(());
-        trace!("drop datagram {} = {}", self.src(), self.local_port);
+        debug!("drop datagram {} = {}", self.src(), self.local_port);
     }
 }
 
@@ -941,7 +941,7 @@ impl DatagramWorker2 {
                     }
                 } else {
                     is_closed_cloned.store(true, Ordering::Relaxed);
-                    trace!(
+                    debug!(
                         "close datagram {} = {}",
                         local_port,
                         u64_to_socket_addr_v4(a_src_cloned.load(Ordering::Relaxed))
@@ -952,7 +952,7 @@ impl DatagramWorker2 {
             }
         });
 
-        trace!("create datagram {} = {}", src, local_port);
+        debug!("create datagram {} = {}", src, local_port);
 
         Ok((
             DatagramWorker2 {
@@ -982,7 +982,7 @@ impl DatagramWorker2 {
     pub fn set_src(&mut self, src: &SocketAddrV4) {
         self.src
             .store(socket_addr_v4_to_u64(src), Ordering::Relaxed);
-        trace!("set datagram {} = {}", src, self.local_port);
+        debug!("set datagram {} = {}", src, self.local_port);
     }
 
     /// Returns the source of the worker.
@@ -999,7 +999,7 @@ impl DatagramWorker2 {
 impl Drop for DatagramWorker2 {
     fn drop(&mut self) {
         let _ = self.close_tx.try_send(());
-        trace!("drop datagram {} = {}", self.src(), self.local_port);
+        debug!("drop datagram {} = {}", self.src(), self.local_port);
     }
 }
 

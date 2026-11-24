@@ -43,7 +43,8 @@ proxy loop.
 
 `-h, --help`: Prints help information.
 
-`-v, --verbose`: Prints verbose information (`-vv` for vverbose).
+`-v, --verbose`: Prints connection lifecycle and cleanup events. Use `-vv`
+for per-packet traffic and detailed TCP state logs.
 
 `-V, --version`: Prints version information.
 

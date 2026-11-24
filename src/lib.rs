@@ -2124,7 +2124,7 @@ impl Redirector {
             self.udp_lru.pop(&local_port);
             self.datagram_map.remove(&src);
 
-            trace!("unbind UDP port {} = {}", local_port, src);
+            debug!("unbind UDP port {} = {}", local_port, src);
         }
     }
 

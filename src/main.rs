@@ -194,7 +194,7 @@ struct Flags {
     #[structopt(
         long,
         short,
-        help = "Prints verbose information (-vv for vverbose)",
+        help = "Prints connection lifecycle logs (-vv for packet and TCP state details)",
         parse(from_occurrences)
     )]
     pub verbose: usize,
