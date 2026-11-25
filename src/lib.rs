@@ -544,25 +544,18 @@ impl Forwarder {
                 let state = self
                     .get_state_mut(dst, src)
                     .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+                // Assign new data after all previously cached bytes, even
+                // if sending those bytes to the interface failed.
+                let sequence = state.cache().recv_next();
                 let payload = state.append_cache(size)?;
 
                 // If the queue is empty and a FIN is in the queue, pop it
                 if state.queue().is_empty() && state.queue_fin() && state.cache().len() < state.src_window() {
                     // ACK/FIN
                     state.append_cache_fin();
-
-                    // Send
-                    let state = self
-                        .get_state(dst, src)
-                        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-                    let sequence = state.sequence();
                     self.send_tcp_ack(dst, src, sequence, &payload, true)?;
                 } else {
                     // ACK
-                    let state = self
-                        .get_state(dst, src)
-                        .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-                    let sequence = state.sequence();
                     self.send_tcp_ack(dst, src, sequence, &payload, false)?;
                 }
             }
@@ -691,7 +684,7 @@ impl Forwarder {
             return self.send_tcp_ack(dst, src, sequence, &payload, false);
         }
         if !state.queue().is_empty() {
-            let sequence = state.sequence();
+            let sequence = state.cache().recv_next();
             let payload = state.append_cache(1)?;
             return self.send_tcp_ack(dst, src, sequence, &payload, false);
         }
@@ -2475,6 +2468,95 @@ mod tcp_control_packet_tests {
         ) -> Option<io::Result<()>> {
             self.0.lock().unwrap().push(packet.to_vec());
             Some(Ok(()))
+        }
+    }
+
+    struct FailOnceSender {
+        inner: RecordingSender,
+        remaining: Option<usize>,
+    }
+
+    impl DataLinkSender for FailOnceSender {
+        fn build_and_send(
+            &mut self,
+            num_packets: usize,
+            packet_size: usize,
+            func: &mut dyn FnMut(&mut [u8]),
+        ) -> Option<io::Result<()>> {
+            if let Some(remaining) = self.remaining {
+                if remaining == 0 {
+                    self.remaining = None;
+                    return Some(Err(io::Error::from(io::ErrorKind::WouldBlock)));
+                }
+                self.remaining = Some(remaining - 1);
+            }
+            self.inner.build_and_send(num_packets, packet_size, func)
+        }
+
+        fn send_to(
+            &mut self,
+            packet: &[u8],
+            interface: Option<NetworkInterface>,
+        ) -> Option<io::Result<()>> {
+            self.inner.send_to(packet, interface)
+        }
+    }
+
+    #[test]
+    fn transmit_failure_preserves_cached_sequence_numbers() {
+        let src = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000);
+        let dst = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443);
+        let initial = u32::MAX - 1459;
+        let first = vec![1; 2920];
+        let second = vec![2; 1460];
+
+        for fail_at in [0, 1] {
+            let frames = Arc::new(Mutex::new(Vec::new()));
+            let mut tx = Forwarder::new(
+                Box::new(FailOnceSender {
+                    inner: RecordingSender(Arc::clone(&frames)),
+                    remaining: Some(fail_at),
+                }),
+                1500,
+                pcap::HARDWARE_ADDR_UNSPECIFIED,
+                *src.ip(),
+            );
+            let mut state = TcpTxState::new(
+                src, dst, initial, 301, 65535, None, false, None, 1460,
+            );
+            *state.cc_mut() = None;
+            tx.set_state(dst, src, state);
+
+            assert!(tx.queue_tcp(dst, src, &first).is_err());
+            let state = tx.get_state(dst, src).unwrap();
+            // Only successful transmissions advance the historical counter.
+            assert_eq!(state.sequence(), initial.wrapping_add((fail_at * 1460) as u32));
+            assert_eq!(state.cache().recv_next(), initial.wrapping_add(2920));
+            assert_eq!(state.cache().len(), 2920);
+
+            tx.queue_tcp(dst, src, &second).unwrap();
+            tx.retransmit_tcp(dst, src, None).unwrap();
+
+            let state = tx.get_state(dst, src).unwrap();
+            assert_eq!(state.sequence(), initial.wrapping_add(4380));
+            let frames = frames.lock().unwrap();
+            let packets: Vec<_> = frames.iter().map(|frame| {
+                let ethernet = EthernetPacket::new(frame).unwrap();
+                let ipv4 = Ipv4Packet::new(ethernet.payload()).unwrap();
+                let tcp = TcpPacket::new(ipv4.payload()).unwrap();
+                (tcp.get_sequence(), tcp.payload().to_vec())
+            }).collect();
+            let mut expected = Vec::new();
+            if fail_at == 1 {
+                expected.push((initial, vec![1; 1460]));
+            }
+            expected.extend([
+                (initial.wrapping_add(2920), vec![2; 1460]),
+                (initial, vec![1; 1460]),
+                (initial.wrapping_add(1460), vec![1; 1460]),
+                (initial.wrapping_add(2920), vec![2; 1460]),
+            ]);
+            assert_eq!(packets, expected);
         }
     }
 
