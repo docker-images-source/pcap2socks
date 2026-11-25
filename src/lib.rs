@@ -1449,10 +1449,10 @@ impl Redirector {
             }
             match event {
                 TcpWorkerEvent::WriteClosed => self.finish_tcp_if_closed(src, dst),
-                TcpWorkerEvent::WriteFailed => {
+                TcpWorkerEvent::WriteFailed | TcpWorkerEvent::ReadFailed => {
                     let reset = self.tx.lock().unwrap().send_tcp_ack_rst(dst, src);
                     if let Err(e) = reset {
-                        warn!("send TCP reset after proxy write failure: {}", e);
+                        warn!("send TCP reset after proxy I/O failure: {}", e);
                     }
                     self.clean_up(src, dst);
                 }
@@ -2522,6 +2522,15 @@ mod tcp_control_packet_tests {
 
     #[test]
     fn failed_proxy_write_resets_and_releases_current_connection() {
+        check_failed_proxy_io(|| TcpWorkerEvent::WriteFailed);
+    }
+
+    #[test]
+    fn failed_proxy_read_resets_and_releases_current_connection() {
+        check_failed_proxy_io(|| TcpWorkerEvent::ReadFailed);
+    }
+
+    fn check_failed_proxy_io(event: impl Fn() -> TcpWorkerEvent) {
         let host = Ipv4Addr::new(192, 0, 2, 250);
         let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 40000);
         let dst = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 443);
@@ -2542,13 +2551,13 @@ mod tcp_control_packet_tests {
         redirector.states.insert(key, TcpRxState::new(src, dst, 300, 0, 0, false));
         redirector.stream_ids.insert(key, 2);
 
-        // A failed writer from an earlier generation must not reset this stream.
-        assert!(redirector.tcp_event_tx.send((src, dst, 1, TcpWorkerEvent::WriteFailed)).is_ok());
+        // A failed worker from an earlier generation must not reset this stream.
+        assert!(redirector.tcp_event_tx.send((src, dst, 1, event())).is_ok());
         redirector.poll_tcp_events();
         assert_eq!(redirector.stream_ids.get(&key), Some(&2));
         assert!(frames.lock().unwrap().is_empty());
 
-        assert!(redirector.tcp_event_tx.send((src, dst, 2, TcpWorkerEvent::WriteFailed)).is_ok());
+        assert!(redirector.tcp_event_tx.send((src, dst, 2, event())).is_ok());
         redirector.poll_tcp_events();
         assert!(!redirector.stream_ids.contains_key(&key));
         assert!(!redirector.states.contains_key(&key));

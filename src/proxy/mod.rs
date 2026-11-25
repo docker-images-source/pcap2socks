@@ -17,6 +17,7 @@ use socks::{SocksAuth, SocksOption};
 pub(crate) enum TcpWorkerEvent {
     WriteClosed,
     WriteFailed,
+    ReadFailed,
     Stalled,
 }
 
@@ -217,6 +218,8 @@ impl StreamWorker {
             debug!("close stream TX {} -> {}", src, dst);
         });
 
+        let reader_events = events.clone();
+
         // Receive
         tokio::spawn(async move {
             let mut buffer = vec![0u8; u16::MAX as usize];
@@ -259,8 +262,11 @@ impl StreamWorker {
                                 }
 
                                 warn!("receive from proxy: {}: {} -> {}: {}", "TCP", dst, src, e);
-
-                                size = 0;
+                                is_rx_closed_cloned.store(true, Ordering::Relaxed);
+                                if let Some((ref sender, id)) = reader_events {
+                                    let _ = sender.send((src, dst, id, TcpWorkerEvent::ReadFailed));
+                                }
+                                return;
                             }
                         },
                         _ = rx_close_rx_fut => size = 0
