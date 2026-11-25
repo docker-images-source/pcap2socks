@@ -1805,11 +1805,12 @@ impl Redirector {
                                     tx_locked.send_tcp_delay_ack_0(dst, src)?;
                                 }
                                 Err(e) => {
-                                    // Send ACK/RST
-                                    self.tx.lock().unwrap().send_tcp_ack_rst(dst, src)?;
-
-                                    // Clean up
+                                    // Clean up even if sending the reset fails.
+                                    let reset = self.tx.lock().unwrap().send_tcp_ack_rst(dst, src);
                                     self.clean_up(src, dst);
+                                    if let Err(reset_err) = reset {
+                                        warn!("send TCP reset after proxy queue failure: {}", reset_err);
+                                    }
 
                                     return Err(e);
                                 }
@@ -1833,13 +1834,10 @@ impl Redirector {
                         }
                     }
                 } else {
-                    // Send ACK/RST
-                    self.tx.lock().unwrap().send_tcp_ack_rst(dst, src)?;
-
-                    // Clean up
+                    // Clean up even if sending the reset fails.
+                    let reset = self.tx.lock().unwrap().send_tcp_ack_rst(dst, src);
                     self.clean_up(src, dst);
-
-                    return Ok(());
+                    return reset;
                 }
             } else {
                 // Duplicate ACK
@@ -2500,6 +2498,58 @@ mod tcp_control_packet_tests {
         ) -> Option<io::Result<()>> {
             self.inner.send_to(packet, interface)
         }
+    }
+
+    #[tokio::test]
+    async fn proxy_queue_failure_cleans_up_even_if_reset_fails() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let src = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000);
+        let dst = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443);
+        let listener = TcpListener::bind((*src.ip(), 0)).await.unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let forwarder = Forwarder::new(
+            Box::new(FailOnceSender {
+                inner: RecordingSender(Arc::clone(&frames)),
+                // Allow the SYN-ACK, then fail the RST transmission.
+                remaining: Some(1),
+            }),
+            1500,
+            pcap::HARDWARE_ADDR_UNSPECIFIED,
+            *src.ip(),
+        );
+        let mut redirector = Redirector::new(
+            Arc::new(Mutex::new(forwarder)), Ipv4Network::new(*src.ip(), 32).unwrap(),
+            *src.ip(), None, ProxyConfig::new_socks(dst, false, false, None), None,
+        );
+        redirector.tx.lock().unwrap().set_state(dst, src, TcpTxState::new(
+            src, dst, 1000, 301, 65535, None, false, None, 1460,
+        ));
+        let key = (src, dst);
+        redirector.states.insert(key, TcpRxState::new(src, dst, 300, 0, 0, false));
+        // Simulate an exhausted shared writer budget without allocating memory.
+        redirector.tcp_queued_bytes.store(usize::MAX, Ordering::Relaxed);
+        let worker = StreamWorker::from_connected(
+            redirector.get_tx(), src, dst, socket, Some((redirector.tcp_event_tx.clone(), 1)),
+            Arc::clone(&redirector.tcp_queued_bytes),
+        ).unwrap();
+        redirector.stream_ids.insert(key, 1);
+        redirector.streams.insert(key, worker);
+
+        let ip = Ipv4::new(0, LayerKinds::Tcp, *src.ip(), *dst.ip()).unwrap();
+        let mut ack = Tcp::new_ack(src.port(), dst.port(), 301, 1001, 65535, None, None);
+        ack.set_ipv4_layer(&ip);
+        let error = redirector.handle_tcp_ack(&ack, b"data").unwrap_err();
+
+        // Preserve the original queue error rather than the RST send error.
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        assert!(!redirector.streams.contains_key(&key));
+        assert!(!redirector.stream_ids.contains_key(&key));
+        assert!(!redirector.states.contains_key(&key));
+        assert!(redirector.tx.lock().unwrap().get_state(dst, src).is_none());
+        assert_eq!(frames.lock().unwrap().len(), 1);
     }
 
     #[test]
