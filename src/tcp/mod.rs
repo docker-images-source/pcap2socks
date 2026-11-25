@@ -570,6 +570,7 @@ pub struct TcpTxState {
     cache_fin_retrans: bool,
     fin_acknowledged: bool,
     last_ack_progress: Instant,
+    zero_window_probe: Option<Timer>,
     queue: VecDeque<u8>,
     queue_fin: bool,
     rto: u64,
@@ -622,6 +623,7 @@ impl TcpTxState {
             cache_fin_retrans: true,
             fin_acknowledged: false,
             last_ack_progress: Instant::now(),
+            zero_window_probe: None,
             queue: VecDeque::new(),
             queue_fin: false,
             rto: INITIAL_RTO,
@@ -641,6 +643,9 @@ impl TcpTxState {
     /// Sets the source window of the TCP connection.
     pub fn set_src_window(&mut self, window: usize) {
         self.src_window = window;
+        if window > 0 {
+            self.zero_window_probe = None;
+        }
         trace!(
             "set TCP source window of {} -> {} to {}",
             self.dst,
@@ -1028,6 +1033,29 @@ impl TcpTxState {
             .is_some_and(|sent| sent.elapsed() >= Duration::from_millis(self.rto))
     }
 
+    /// Schedules persist probes independently of the retransmission timer.
+    pub(crate) fn zero_window_probe_due(&mut self) -> bool {
+        if self.src_window != 0 || self.cache_syn.is_some()
+            || (self.cache.is_empty() && self.queue.is_empty()
+                && self.cache_fin.is_none() && !self.queue_fin)
+        {
+            self.zero_window_probe = None;
+            return false;
+        }
+        match self.zero_window_probe {
+            None => {
+                self.zero_window_probe = Some(Timer::new(self.rto));
+                false
+            }
+            Some(timer) if timer.is_timedout() => {
+                let timeout = (timer.timeout.as_millis() as u64).saturating_mul(2);
+                self.zero_window_probe = Some(Timer::new(min(timeout, MAX_RTO)));
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Returns the TCP FIN in the cache of the TCP connection.
     pub fn cache_fin(&self) -> Option<Timer> {
         self.cache_fin
@@ -1128,6 +1156,27 @@ mod stall_tests {
         state.update_syn_timer();
         assert!(state.rto() > previous_rto);
         assert!(!state.syn_retransmit_due());
+    }
+
+    #[test]
+    fn zero_window_probe_backs_off_and_resets_on_window_update() {
+        let mut state = state();
+        state.set_src_window(0);
+        assert!(!state.zero_window_probe_due());
+        assert!(state.zero_window_probe.is_none());
+
+        state.append_queue(&[42]).unwrap();
+        assert!(!state.zero_window_probe_due());
+        let timer = state.zero_window_probe.as_mut().unwrap();
+        timer.instant -= timer.timeout + Duration::from_millis(1);
+        assert!(state.zero_window_probe_due());
+        assert_eq!(state.zero_window_probe.unwrap().timeout,
+            Duration::from_millis(state.rto() * 2));
+        assert!(!state.zero_window_probe_due());
+
+        state.set_src_window(1024);
+        assert!(state.zero_window_probe.is_none());
+        assert!(!state.zero_window_probe_due());
     }
 
     #[test]

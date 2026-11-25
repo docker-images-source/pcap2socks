@@ -680,6 +680,34 @@ impl Forwarder {
         Ok(())
     }
 
+    /// Probes a closed peer window without draining the send queue.
+    fn send_tcp_zero_window_probe(&mut self, dst: SocketAddrV4, src: SocketAddrV4) -> io::Result<()> {
+        let state = self
+            .get_state_mut(dst, src)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        if !state.cache().is_empty() {
+            let sequence = state.cache().sequence();
+            let payload = state.cache().get(sequence, 1)?;
+            return self.send_tcp_ack(dst, src, sequence, &payload, false);
+        }
+        if !state.queue().is_empty() {
+            let sequence = state.sequence();
+            let payload = state.append_cache(1)?;
+            return self.send_tcp_ack(dst, src, sequence, &payload, false);
+        }
+        if state.cache_fin().is_some() {
+            state.update_fin_timer();
+            return self.send_tcp_fin(dst, src);
+        }
+
+        // A queued FIN without data can elicit a window update with an old ACK.
+        let tcp = Tcp::new_ack(
+            dst.port(), src.port(), state.sequence().wrapping_sub(1),
+            state.acknowledgement(), self.get_tcp_window(dst, src), None, None,
+        );
+        self.send_ipv4(*dst.ip(), *src.ip(), Layers::Tcp(tcp), None)
+    }
+
     /// Sends an TCP ACK packet without payload.
     pub fn send_tcp_ack_0(&mut self, dst: SocketAddrV4, src: SocketAddrV4) -> io::Result<()> {
         // TCP
@@ -1108,6 +1136,16 @@ impl ForwardStream for Forwarder {
                 io::ErrorKind::TimedOut,
                 "TCP acknowledgement stalled",
             ));
+        }
+        if state.src_window() == 0 && state.cache_syn().is_none() {
+            let state = self.get_state_mut(dst, src).unwrap();
+            if state.zero_window_probe_due() {
+                self.send_tcp_zero_window_probe(dst, src)?;
+            }
+            if self.get_state(dst, src).unwrap().delayed_ack() {
+                self.send_tcp_ack_0(dst, src)?;
+            }
+            return Ok(());
         }
         self.retransmit_tcp_timedout(dst, src)
     }
@@ -2437,6 +2475,48 @@ mod tcp_control_packet_tests {
         ) -> Option<io::Result<()>> {
             self.0.lock().unwrap().push(packet.to_vec());
             Some(Ok(()))
+        }
+    }
+
+    #[test]
+    fn zero_window_probe_reuses_sequence_and_preserves_queued_data() {
+        let src = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 40000);
+        let dst = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 443);
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let mut tx = Forwarder::new(
+            Box::new(RecordingSender(Arc::clone(&frames))), 1500,
+            pcap::HARDWARE_ADDR_UNSPECIFIED, *src.ip(),
+        );
+        tx.set_state(dst, src, TcpTxState::new(
+            src, dst, u32::MAX, 301, 0, None, false, None, 1460,
+        ));
+        tx.queue_tcp(dst, src, b"abc").unwrap();
+        assert!(frames.lock().unwrap().is_empty());
+
+        tx.send_tcp_zero_window_probe(dst, src).unwrap();
+        tx.send_tcp_zero_window_probe(dst, src).unwrap();
+        {
+            let state = tx.get_state_mut(dst, src).unwrap();
+            assert_eq!(state.sequence(), 0);
+            assert_eq!(state.cache().len(), 1);
+            assert_eq!(state.queue().len(), 2);
+            state.acknowledge(0);
+            state.set_src_window(1024);
+        }
+        tx.send_tcp(dst, src).unwrap();
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 3);
+        for (frame, sequence, payload) in [
+            (&frames[0], u32::MAX, &b"a"[..]),
+            (&frames[1], u32::MAX, &b"a"[..]),
+            (&frames[2], 0, &b"bc"[..]),
+        ] {
+            let ethernet = EthernetPacket::new(frame).unwrap();
+            let ipv4 = Ipv4Packet::new(ethernet.payload()).unwrap();
+            let tcp = TcpPacket::new(ipv4.payload()).unwrap();
+            assert_eq!(tcp.get_sequence(), sequence);
+            assert_eq!(tcp.payload(), payload);
         }
     }
 
