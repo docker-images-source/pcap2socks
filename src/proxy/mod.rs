@@ -779,7 +779,7 @@ impl DatagramWorker {
                     };
                 }
 
-                if !closed && size > 0 {
+                if !closed {
                     *last_used_rx.lock().unwrap() = Instant::now();
                     // Send
                     if let Err(ref e) = tx.lock().unwrap().forward(
