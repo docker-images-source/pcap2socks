@@ -1363,80 +1363,124 @@ impl Redirector {
     }
 
     /// Opens an `Interface` for redirection and monitoring.
+    ///
+    /// The capture receiver is consumed and cannot be reused after this call.
     pub async fn open_monitored(
         &mut self,
         rx: &mut Receiver,
         is_running: Option<Arc<AtomicBool>>,
     ) -> io::Result<()> {
+        struct ConsumedReceiver;
+        impl pnet::datalink::DataLinkReceiver for ConsumedReceiver {
+            fn next(&mut self) -> io::Result<&[u8]> {
+                Err(io::Error::other("capture receiver already consumed"))
+            }
+        }
+
+        struct StopCapture(Arc<AtomicBool>);
+        impl Drop for StopCapture {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
         // Send gratuitous ARP
         if self.gw_ip_addr.is_some() {
             self.tx.lock().unwrap().send_gratuitous_arp()?;
         }
+
+        let mut capture_rx = std::mem::replace(rx, Box::new(ConsumedReceiver));
+        let stop = Arc::new(AtomicBool::new(false));
+        let _stop_capture = StopCapture(Arc::clone(&stop));
+        let (frame_tx, mut frame_rx) = mpsc::channel::<io::Result<Vec<u8>>>(128);
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match capture_rx.next() {
+                    Ok(frame) => {
+                        // Backpressure preserves frame ordering without silently dropping data.
+                        if frame_tx.blocking_send(Ok(frame.to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) if matches!(e.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock) => {
+                        thread::sleep(Duration::from_millis(TIMEDOUT_WAIT));
+                    }
+                    Err(e) => {
+                        let _ = frame_tx.blocking_send(Err(e));
+                        break;
+                    }
+                }
+            }
+        });
+
         let mut last_udp_cleanup = Instant::now();
+        let mut maintenance_tick = tokio::time::interval(Duration::from_millis(250));
+        maintenance_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
-            if last_udp_cleanup.elapsed() >= UDP_CLEANUP_INTERVAL {
-                self.prune_closed_udp_ports();
-                self.defrag.prune_expired();
-                let expired: Vec<_> = self.states.iter()
-                    .filter(|(key, state)| self.streams.contains_key(key)
-                        && state.is_idle(TCP_IDLE_TIMEOUT))
-                    .map(|(key, _)| *key)
-                    .collect();
-                for (src, dst) in expired {
-                    debug!("expire idle TCP connection {} -> {}", src, dst);
-                    self.clean_up(src, dst);
-                }
-                last_udp_cleanup = Instant::now();
-            }
-            // Drop stale streams on the receiving task, which owns both state maps.
-            // The pcap read timeout also wakes this loop on a quiet LAN.
-            self.poll_tcp_events();
-            self.poll_connect_results();
-            self.prune_abandoned_udp_associations();
-
-            // Monitor
             if let Some(is_running) = &is_running {
                 if !is_running.load(Ordering::Relaxed) {
                     return Ok(());
                 }
             }
-            match rx.next() {
-                Ok(frame) => {
-                    if let Some(ref indicator) = Indicator::from(frame) {
-                        if let Some(t) = indicator.network_kind() {
-                            match t {
-                                LayerKinds::Arp => {
-                                    if let Err(ref e) = self.handle_arp(indicator) {
-                                        warn!("handle {}: {}", indicator.brief(), e);
+
+            tokio::select! {
+                Some(event) = self.tcp_event_rx.recv() => self.drain_tcp_events(Some(event)),
+                Some(ready) = self.tcp_ready_rx.recv() => self.poll_connect_results(Some(ready), None),
+                Some(ready) = self.udp_ready_rx.recv() => self.poll_connect_results(None, Some(ready)),
+                frame = frame_rx.recv() => match frame {
+                    Some(Ok(frame)) => {
+                        if let Some(ref indicator) = Indicator::from(&frame) {
+                            if let Some(t) = indicator.network_kind() {
+                                match t {
+                                    LayerKinds::Arp => {
+                                        if let Err(ref e) = self.handle_arp(indicator) {
+                                            warn!("handle {}: {}", indicator.brief(), e);
+                                        }
                                     }
-                                }
-                                LayerKinds::Ipv4 => {
-                                    if let Err(ref e) = self.handle_ipv4(indicator, frame).await {
-                                        warn!("handle {}: {}", indicator.brief(), e);
+                                    LayerKinds::Ipv4 => {
+                                        if let Err(ref e) = self.handle_ipv4(indicator, &frame).await {
+                                            warn!("handle {}: {}", indicator.brief(), e);
+                                        }
                                     }
+                                    _ => unreachable!(),
                                 }
-                                _ => unreachable!(),
                             }
                         }
-                    };
-                }
-                Err(e) => {
-                    if matches!(
-                        e.kind(),
-                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                    ) {
-                        thread::sleep(Duration::from_millis(TIMEDOUT_WAIT));
-                        continue;
                     }
-                    return Err(e);
+                    Some(Err(e)) => return Err(e),
+                    None => return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe, "capture reader stopped unexpectedly",
+                    )),
+                },
+                _ = maintenance_tick.tick() => {
+                    if last_udp_cleanup.elapsed() >= UDP_CLEANUP_INTERVAL {
+                        self.prune_closed_udp_ports();
+                        self.defrag.prune_expired();
+                        let expired: Vec<_> = self.states.iter()
+                            .filter(|(key, state)| self.streams.contains_key(key)
+                                && state.is_idle(TCP_IDLE_TIMEOUT))
+                            .map(|(key, _)| *key)
+                            .collect();
+                        for (src, dst) in expired {
+                            debug!("expire idle TCP connection {} -> {}", src, dst);
+                            self.clean_up(src, dst);
+                        }
+                        last_udp_cleanup = Instant::now();
+                    }
+                    self.prune_abandoned_udp_associations();
                 }
-            };
+            }
         }
     }
 
+    #[cfg(test)]
     fn poll_tcp_events(&mut self) {
-        while let Ok((src, dst, id, event)) = self.tcp_event_rx.try_recv() {
+        self.drain_tcp_events(None);
+    }
+
+    fn drain_tcp_events(&mut self, mut first: Option<TcpEvent>) {
+        while let Some((src, dst, id, event)) = first.take().or_else(|| self.tcp_event_rx.try_recv().ok()) {
             if self.stream_ids.get(&(src, dst)) != Some(&id) {
                 continue;
             }
@@ -1470,8 +1514,8 @@ impl Redirector {
     }
 
     /// Accept completed proxy handshakes on the task that owns TCP/UDP maps.
-    fn poll_connect_results(&mut self) {
-        while let Ok((src, dst, id, result)) = self.tcp_ready_rx.try_recv() {
+    fn poll_connect_results(&mut self, mut first_tcp: Option<TcpReady>, mut first_udp: Option<UdpReady>) {
+        while let Some((src, dst, id, result)) = first_tcp.take().or_else(|| self.tcp_ready_rx.try_recv().ok()) {
             let key = (src, dst);
             if self.pending_tcp.get(&key).map(|(generation, _)| *generation) != Some(id) {
                 continue;
@@ -1496,7 +1540,7 @@ impl Redirector {
             }
         }
 
-        while let Ok((src, id, result)) = self.udp_ready_rx.try_recv() {
+        while let Some((src, id, result)) = first_udp.take().or_else(|| self.udp_ready_rx.try_recv().ok()) {
             if self.pending_udp.get(&src).map(|pending| pending.id) != Some(id) {
                 continue;
             }
@@ -2941,5 +2985,53 @@ mod malformed_icmp_tests {
         let error = Icmpv4::new_destination_port_unreachable(&quote);
         assert_eq!(error.next_level_layer_kind(), None);
         assert!(redirector().handle_icmpv4(&error).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod capture_loop_tests {
+    use super::*;
+    use pnet::util::MacAddr;
+
+    struct SlowReceiver;
+
+    impl pnet::datalink::DataLinkReceiver for SlowReceiver {
+        fn next(&mut self) -> io::Result<&[u8]> {
+            thread::sleep(Duration::from_secs(2));
+            Err(io::Error::from(io::ErrorKind::TimedOut))
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stopping_does_not_wait_for_capture_timeout() {
+        let host = Ipv4Addr::new(192, 168, 1, 10);
+        let gateway = Ipv4Addr::new(192, 168, 1, 250);
+        let forwarder = Forwarder::new(
+            Box::new(pcap::BlackHole::new()),
+            1500,
+            MacAddr(2, 0, 0, 0, 0, 10),
+            host,
+        );
+        let mut redirector = Redirector::new(
+            Arc::new(Mutex::new(forwarder)),
+            Ipv4Network::new(Ipv4Addr::new(192, 168, 1, 101), 32).unwrap(),
+            gateway,
+            Some(gateway),
+            ProxyConfig::new_socks(SocketAddrV4::new(host, 1083), false, false, None),
+            None,
+        );
+        let mut rx: Receiver = Box::new(SlowReceiver);
+        let running = Arc::new(AtomicBool::new(true));
+        let flag = Arc::clone(&running);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            flag.store(false, Ordering::Relaxed);
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            redirector.open_monitored(&mut rx, Some(running)),
+        ).await;
+        assert!(matches!(result, Ok(Ok(()))), "stop result: {:?}", result);
     }
 }
