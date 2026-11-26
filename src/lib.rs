@@ -1606,7 +1606,7 @@ impl Redirector {
         if let Some(gw_ip_addr) = self.gw_ip_addr {
             if let Some(arp) = indicator.arp() {
                 let src = arp.src();
-                if src != self.local_ip_addr
+                if arp.is_request() && src != self.local_ip_addr
                     && self.src_ip_addr.contains(src)
                     && arp.dst() == gw_ip_addr
                 {
