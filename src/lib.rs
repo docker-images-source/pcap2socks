@@ -799,15 +799,15 @@ impl Forwarder {
         Ok(())
     }
 
-    /// Sends an TCP ACK/RST packet of an untracked connection.
+    /// Sends an untracked RST/ACK packet for a segment without ACK.
     pub fn send_tcp_ack_rst_untracked(
         &mut self,
         dst: SocketAddrV4,
         src: SocketAddrV4,
-        sequence: u32,
+        acknowledgement: u32,
     ) -> io::Result<()> {
         // TCP
-        let tcp = Tcp::new_ack_rst(dst.port(), src.port(), sequence, 0, 0, None);
+        let tcp = Tcp::new_ack_rst(dst.port(), src.port(), 0, acknowledgement, 0, None);
 
         // Send
         self.send_ipv4(*dst.ip(), *src.ip(), Layers::Tcp(tcp), None)
@@ -1932,7 +1932,7 @@ impl Redirector {
             self.tx
                 .lock()
                 .unwrap()
-                .send_tcp_ack_rst_untracked(dst, src, tcp.acknowledgement())?;
+                .send_tcp_rst(dst, src, tcp.acknowledgement())?;
         }
 
         Ok(())
@@ -2099,7 +2099,9 @@ impl Redirector {
             self.tx
                 .lock()
                 .unwrap()
-                .send_tcp_ack_rst_untracked(dst, src, tcp.acknowledgement())?;
+                .send_tcp_ack_rst_untracked(
+                    dst, src, tcp.sequence().wrapping_add(payload.len() as u32).wrapping_add(1),
+                )?;
         }
 
         Ok(())
@@ -2923,6 +2925,52 @@ mod tcp_control_packet_tests {
             assert_eq!(tcp.get_acknowledgement(), acknowledgement);
             assert!(redirector.tx.lock().unwrap().get_state(dst, src).is_none());
         }
+    }
+
+    #[test]
+    fn untracked_reset_uses_correct_flags_and_sequence() {
+        let host = Ipv4Addr::new(192, 0, 2, 250);
+        let src = SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 40000);
+        let dst = SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 1), 443);
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let forwarder = Forwarder::new(
+            Box::new(RecordingSender(Arc::clone(&frames))),
+            1500, pcap::HARDWARE_ADDR_UNSPECIFIED, host,
+        );
+        let mut redirector = Redirector::new(
+            Arc::new(Mutex::new(forwarder)),
+            Ipv4Network::new(*src.ip(), 32).unwrap(),
+            host, None,
+            ProxyConfig::new_socks(SocketAddrV4::new(host, 1083), false, false, None),
+            None,
+        );
+        let ipv4 = Ipv4::new(0, LayerKinds::Tcp, *src.ip(), *dst.ip()).unwrap();
+
+        let mut ack = Tcp::new_ack(src.port(), dst.port(), 100, 1234, 4096, None, None);
+        ack.set_ipv4_layer(&ipv4);
+        redirector.handle_tcp_ack(&ack, &[]).unwrap();
+
+        // A bare FIN at the wrap boundary consumes one sequence number.
+        let mut bytes = [0u8; 20];
+        let mut packet = pnet::packet::tcp::MutableTcpPacket::new(&mut bytes).unwrap();
+        packet.set_source(src.port());
+        packet.set_destination(dst.port());
+        packet.set_sequence(u32::MAX);
+        packet.set_flags(TcpFlags::FIN);
+        packet.set_data_offset(5);
+        let fin = Tcp::parse(&packet.to_immutable(), &ipv4);
+        redirector.handle_tcp_fin(&fin, b"ab").unwrap();
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 2);
+        let resets: Vec<_> = frames.iter().map(|frame| {
+            let eth = EthernetPacket::new(frame).unwrap();
+            let ip = Ipv4Packet::new(eth.payload()).unwrap();
+            let tcp = TcpPacket::new(ip.payload()).unwrap();
+            (tcp.get_flags(), tcp.get_sequence(), tcp.get_acknowledgement())
+        }).collect();
+        assert_eq!(resets[0], (TcpFlags::RST, 1234, 0));
+        assert_eq!(resets[1], (TcpFlags::RST | TcpFlags::ACK, 0, 2));
     }
 }
 
